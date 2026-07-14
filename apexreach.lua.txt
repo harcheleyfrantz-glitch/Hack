@@ -1,0 +1,1702 @@
+--[[
+================================================================================
+    APEX REACH  ·  v5  ·  "win anytime"  ·  Delta iOS / universal executor
+--------------------------------------------------------------------------------
+    A full universal sword-reach suite built to beat other reach exploiters.
+
+    WHY THIS WINS THE DUEL
+      · Retaliation engine  — detects who is reaching YOU and nukes them first,
+                              faster than their loop can kill you.
+      · Threat priority     — targets by (is-attacking-me > lowest-hp > nearest),
+                              so the real danger dies before it deletes you.
+      · Triple-loop firing  — RenderStepped + Heartbeat + Stepped, throttled by
+                              a frame budget so you out-hit them WITHOUT lag.
+      · Stacked touches      — configurable hits/frame; out-DPS anyone matching
+                              your reach.
+      · Remote auto-scan     — finds the sword's damage RemoteEvent and fires it
+                              directly for swing-gated games (true one-shot).
+
+    OPTIMIZATION
+      · Player + part caching, alive-only processing, distance culling.
+      · Frame-budget scheduler: never exceeds a target ms/frame so FPS holds.
+      · Connection manager: single source of truth, clean teardown, no leaks.
+
+    HOW TO USE
+      1. Execute this file (or loadstring the raw URL).
+      2. Tap the floating APEX button, or press RightShift, to open the menu.
+      3. Combat tab → set Reach + Hits/Frame. Turn on "Retaliate".
+      4. Equip the sword. You now win.
+================================================================================
+]]
+
+--// ============================================================================
+--//  0. GUARD  — don't double-load, clean up a previous session
+--// ============================================================================
+if _G.APEX_REACH_LOADED then
+    pcall(function() _G.APEX_REACH_UNLOAD() end)
+end
+_G.APEX_REACH_LOADED = true
+
+--// ============================================================================
+--//  1. SERVICES
+--// ============================================================================
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local CoreGui           = game:GetService("CoreGui")
+local Workspace         = game:GetService("Workspace")
+local Lighting          = game:GetService("Lighting")
+local HttpService       = game:GetService("HttpService")
+
+local LocalPlayer       = Players.LocalPlayer
+local Camera            = Workspace.CurrentCamera
+
+--// ============================================================================
+--//  2. EXECUTOR COMPATIBILITY SHIMS
+--//     Not every executor exposes the same globals. Fall back gracefully so
+--//     the script never hard-errors on a missing function.
+--// ============================================================================
+local Compat = {}
+
+-- Parent for the GUI. Tries the safest options in order and NEVER errors:
+--   gethui()  ->  CoreGui  ->  the LocalPlayer's PlayerGui (always works)
+Compat.getgui = function()
+    -- 1) hidden protected container (best, undetectable)
+    local ok, hui = pcall(function() return gethui and gethui() end)
+    if ok and typeof(hui) == "Instance" then return hui end
+    -- 2) CoreGui (works on most PC executors)
+    local ok2, cg = pcall(function()
+        local test = Instance.new("Folder")
+        test.Parent = CoreGui          -- will throw if not permitted
+        test:Destroy()
+        return CoreGui
+    end)
+    if ok2 and cg then return cg end
+    -- 3) PlayerGui — always available, works on every mobile executor
+    local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        or LocalPlayer:WaitForChild("PlayerGui", 5)
+    return pg
+end
+
+-- firetouchinterest is the core hit primitive. Shim a warning if absent.
+Compat.fireTouch = firetouchinterest or function()
+    warn("[APEX] firetouchinterest not supported by this executor")
+end
+
+-- file API (config save). Not all mobile executors expose it.
+Compat.writefile = (typeof(writefile) == "function") and writefile or nil
+Compat.readfile  = (typeof(readfile)  == "function") and readfile  or nil
+Compat.isfile    = (typeof(isfile)    == "function") and isfile    or nil
+
+-- messaging / notify
+Compat.setclipboard = (typeof(setclipboard) == "function") and setclipboard or function() end
+
+--// ============================================================================
+--//  3. SETTINGS  — the single source of truth the whole suite reads from.
+--//     Every GUI control writes into this table; every engine loop reads it.
+--// ============================================================================
+local S = {
+    ----------------------------------------------------------------- combat ----
+    enabled        = true,     -- master switch for the reach engine
+    reach          = 100,      -- reach distance in studs (slider 5 .. 2,000,000)
+    maxReach       = 2000000,
+    hits           = 20,       -- stacked touch cycles per part per frame
+    maxHits        = 150,
+    dmgEnabled     = true,     -- actually apply damage (off = ESP-only)
+    hitMode        = "Sphere", -- "Sphere" | "Line" | "FOV"
+    fovRadius      = 250,      -- pixels, for FOV mode
+    hitParts       = "All",    -- "All" | "HRP" | "Head"  (which parts to touch)
+
+    ----------------------------------------------------------------- targeting -
+    priority       = "Smart",  -- "Smart" | "Nearest" | "LowestHP" | "Threat"
+    teamCheck      = true,     -- ignore teammates
+    wallCheck      = false,    -- require line-of-sight
+    maxTargets     = 6,        -- cap enemies processed per frame (anti-lag)
+    ignoreDead     = true,
+
+    ----------------------------------------------------------------- retaliate -
+    retaliate      = true,     -- detect who reaches YOU and burst them first
+    retalMultiplier= 3,        -- retaliation gets N× the normal hits
+    retalWindow    = 1.0,      -- seconds a player stays flagged as "attacking me"
+
+    ----------------------------------------------------------------- swinging --
+    autoSwing      = true,
+    clickSpeed     = 45,       -- swings/second
+    autoEquip      = true,     -- auto re-equip sword if unequipped
+
+    ----------------------------------------------------------------- remotes ---
+    remoteFire     = true,     -- auto-scan + fire the sword's damage remote
+
+    ----------------------------------------------------------------- performance
+    frameBudgetMs  = 4.0,      -- max ms/frame the engine may spend (FPS guard)
+    useRender      = true,
+    useHeartbeat   = true,
+    useStepped     = false,    -- 3rd loop; only enable if you have FPS to spare
+    cacheRefresh   = 0.5,      -- seconds between full player-cache rebuilds
+
+    ----------------------------------------------------------------- visuals ---
+    espEnabled     = false,
+    espBoxes       = true,
+    espTracers     = false,
+    espNames       = true,
+    espHealth      = true,
+    espColor       = Color3.fromRGB(255, 60, 60),
+    espTeamColor   = false,
+    visualizer     = false,    -- show the reach sphere/line
+    fovCircle      = false,    -- draw the FOV targeting circle
+
+    ----------------------------------------------------------------- misc ------
+    theme          = "Crimson",
+    menuKey        = Enum.KeyCode.RightShift,
+    panicKey       = Enum.KeyCode.RightControl, -- instant disable-all
+    notifications  = true,
+    showHUD        = true,
+}
+
+--// ============================================================================
+--//  4. THEMES  — swap the whole palette live from the GUI.
+--// ============================================================================
+local Themes = {
+    Crimson = {
+        accent  = Color3.fromRGB(220, 40, 55),
+        accent2 = Color3.fromRGB(255, 90, 100),
+        bg      = Color3.fromRGB(18, 18, 22),
+        bg2     = Color3.fromRGB(26, 26, 32),
+        bg3     = Color3.fromRGB(36, 36, 44),
+        text    = Color3.fromRGB(240, 240, 245),
+        subtext = Color3.fromRGB(150, 150, 160),
+        good    = Color3.fromRGB(50, 210, 100),
+        bad     = Color3.fromRGB(230, 60, 60),
+    },
+    Void = {
+        accent  = Color3.fromRGB(130, 80, 255),
+        accent2 = Color3.fromRGB(170, 130, 255),
+        bg      = Color3.fromRGB(14, 14, 20),
+        bg2     = Color3.fromRGB(22, 20, 32),
+        bg3     = Color3.fromRGB(34, 30, 48),
+        text    = Color3.fromRGB(235, 235, 245),
+        subtext = Color3.fromRGB(150, 145, 170),
+        good    = Color3.fromRGB(90, 220, 160),
+        bad     = Color3.fromRGB(240, 80, 120),
+    },
+    Toxic = {
+        accent  = Color3.fromRGB(120, 230, 40),
+        accent2 = Color3.fromRGB(170, 255, 90),
+        bg      = Color3.fromRGB(16, 20, 14),
+        bg2     = Color3.fromRGB(22, 28, 20),
+        bg3     = Color3.fromRGB(32, 40, 28),
+        text    = Color3.fromRGB(238, 245, 235),
+        subtext = Color3.fromRGB(150, 165, 145),
+        good    = Color3.fromRGB(120, 230, 40),
+        bad     = Color3.fromRGB(240, 120, 60),
+    },
+    Ocean = {
+        accent  = Color3.fromRGB(40, 150, 235),
+        accent2 = Color3.fromRGB(90, 190, 255),
+        bg      = Color3.fromRGB(14, 18, 24),
+        bg2     = Color3.fromRGB(20, 26, 34),
+        bg3     = Color3.fromRGB(28, 38, 50),
+        text    = Color3.fromRGB(235, 242, 248),
+        subtext = Color3.fromRGB(145, 160, 175),
+        good    = Color3.fromRGB(60, 210, 180),
+        bad     = Color3.fromRGB(235, 90, 90),
+    },
+    Mono = {
+        accent  = Color3.fromRGB(235, 235, 235),
+        accent2 = Color3.fromRGB(255, 255, 255),
+        bg      = Color3.fromRGB(12, 12, 12),
+        bg2     = Color3.fromRGB(20, 20, 20),
+        bg3     = Color3.fromRGB(32, 32, 32),
+        text    = Color3.fromRGB(245, 245, 245),
+        subtext = Color3.fromRGB(140, 140, 140),
+        good    = Color3.fromRGB(220, 220, 220),
+        bad     = Color3.fromRGB(120, 120, 120),
+    },
+}
+local Theme = Themes[S.theme] or Themes.Crimson
+
+--// ============================================================================
+--//  5. CONNECTION MANAGER  — every connection lives here so unload is clean
+--//     and we never stack duplicate listeners (a top cause of exploit lag).
+--// ============================================================================
+local Conns = {}
+local function bind(signal, fn)
+    local c = signal:Connect(fn)
+    Conns[#Conns + 1] = c
+    return c
+end
+local function unbindAll()
+    for _, c in ipairs(Conns) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(Conns)
+end
+
+--// ============================================================================
+--//  6. UTILITIES
+--// ============================================================================
+local U = {}
+
+function U.round(n, d)
+    local m = 10 ^ (d or 0)
+    return math.floor(n * m + 0.5) / m
+end
+
+function U.clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+
+function U.lerp(a, b, t) return a + (b - a) * t end
+
+-- Human-readable big numbers (2,000,000 -> "2M")
+function U.short(n)
+    n = tonumber(n) or 0
+    if n >= 1e6 then return U.round(n / 1e6, 2) .. "M" end
+    if n >= 1e3 then return U.round(n / 1e3, 1) .. "k" end
+    return tostring(math.floor(n))
+end
+
+-- Safe character getters -----------------------------------------------------
+function U.char(plr)  return plr and plr.Character end
+function U.hum(plr)
+    local c = U.char(plr); return c and c:FindFirstChildOfClass("Humanoid")
+end
+function U.hrp(plr)
+    local c = U.char(plr); return c and c:FindFirstChild("HumanoidRootPart")
+end
+function U.alive(plr)
+    local h = U.hum(plr); return h ~= nil and h.Health > 0
+end
+
+-- The local player's currently-equipped tool + its handle -------------------
+function U.tool()
+    local c = U.char(LocalPlayer)
+    return c and c:FindFirstChildOfClass("Tool")
+end
+function U.handle()
+    local t = U.tool()
+    if not t then return nil, nil end
+    local h = t:FindFirstChild("Handle") or t:FindFirstChildOfClass("BasePart")
+    return h, t
+end
+
+-- Line-of-sight check (for wallCheck) ----------------------------------------
+function U.canSee(fromPos, targetPart, ignoreList)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = ignoreList or { U.char(LocalPlayer) }
+    local dir = (targetPart.Position - fromPos)
+    local res = Workspace:Raycast(fromPos, dir, params)
+    if not res then return true end
+    return res.Instance:IsDescendantOf(targetPart.Parent)
+end
+
+-- World position -> screen point + on-screen flag ----------------------------
+function U.toScreen(pos)
+    local v, on = Camera:WorldToViewportPoint(pos)
+    return Vector2.new(v.X, v.Y), on and v.Z > 0
+end
+
+--// ============================================================================
+--//  7. PLAYER CACHE  — rebuilding "who is an enemy + their parts" every frame
+--//     is the #1 lag source in naive reach scripts. We cache it and refresh on
+--//     a timer + on player add/remove instead.
+--// ============================================================================
+local Cache = {
+    enemies = {},     -- array of { plr, char, hum, hrp, parts = {BasePart...} }
+    lastBuild = 0,
+}
+
+local function collectParts(char)
+    local parts = {}
+    for _, d in ipairs(char:GetChildren()) do
+        if d:IsA("BasePart") then parts[#parts + 1] = d end
+    end
+    return parts
+end
+
+local function isEnemy(plr)
+    if plr == LocalPlayer then return false end
+    if S.ignoreDead and not U.alive(plr) then return false end
+    if S.teamCheck and plr.Team and LocalPlayer.Team and plr.Team == LocalPlayer.Team then
+        return false
+    end
+    return U.hrp(plr) ~= nil
+end
+
+local function rebuildCache()
+    table.clear(Cache.enemies)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if isEnemy(plr) then
+            local char = U.char(plr)
+            Cache.enemies[#Cache.enemies + 1] = {
+                plr   = plr,
+                char  = char,
+                hum   = U.hum(plr),
+                hrp   = U.hrp(plr),
+                parts = collectParts(char),
+            }
+        end
+    end
+    Cache.lastBuild = os.clock()
+end
+
+-- refresh a single entry's live refs cheaply (parts can change on respawn)
+local function refreshEntry(e)
+    if not e.char or not e.char.Parent then return false end
+    e.hum = e.char:FindFirstChildOfClass("Humanoid")
+    e.hrp = e.char:FindFirstChild("HumanoidRootPart")
+    if not e.hum or not e.hrp or e.hum.Health <= 0 then return false end
+    return true
+end
+
+--// ============================================================================
+--//  8. RETALIATION TRACKER  — the secret sauce for beating other reachers.
+--//     We watch our OWN humanoid for damage and flag whoever's nearby with a
+--//     weapon out as an aggressor, so the engine bursts them first.
+--// ============================================================================
+local Retal = {
+    flagged = {},      -- [player] = expiryClock
+    lastHealth = nil,
+}
+
+local function flagAggressors()
+    -- who is close enough + holding a tool = likely the one reaching us
+    local myHrp = U.hrp(LocalPlayer)
+    if not myHrp then return end
+    for _, e in ipairs(Cache.enemies) do
+        local theirTool = e.char and e.char:FindFirstChildOfClass("Tool")
+        if theirTool and e.hrp then
+            local d = (e.hrp.Position - myHrp.Position).Magnitude
+            -- if they're holding a weapon and within a plausible reach window,
+            -- treat them as an active threat when we just took damage.
+            if d <= math.max(S.reach, 80) then
+                Retal.flagged[e.plr] = os.clock() + S.retalWindow
+            end
+        end
+    end
+end
+
+local function isFlagged(plr)
+    local exp = Retal.flagged[plr]
+    return exp ~= nil and exp > os.clock()
+end
+
+local function watchSelfDamage()
+    local hum = U.hum(LocalPlayer)
+    if not hum then return end
+    Retal.lastHealth = hum.Health
+    bind(hum.HealthChanged, function(hp)
+        if Retal.lastHealth and hp < Retal.lastHealth then
+            -- we just took damage -> flag nearby armed enemies
+            flagAggressors()
+        end
+        Retal.lastHealth = hp
+    end)
+end
+
+--// ============================================================================
+--//  9. NOTIFICATION SYSTEM  (lightweight toast stack, top-right)
+--// ============================================================================
+local Notify = {}
+do
+    local holder
+    local function ensureHolder(gui)
+        if holder and holder.Parent then return holder end
+        holder = Instance.new("Frame")
+        holder.Name = "Toasts"
+        holder.AnchorPoint = Vector2.new(1, 0)
+        holder.Position = UDim2.new(1, -12, 0, 12)
+        holder.Size = UDim2.new(0, 260, 1, -24)
+        holder.BackgroundTransparency = 1
+        holder.Parent = gui
+        local list = Instance.new("UIListLayout")
+        list.Padding = UDim.new(0, 8)
+        list.HorizontalAlignment = Enum.HorizontalAlignment.Right
+        list.VerticalAlignment = Enum.VerticalAlignment.Top
+        list.SortOrder = Enum.SortOrder.LayoutOrder
+        list.Parent = holder
+        return holder
+    end
+    Notify.gui = nil
+    function Notify.push(text, kind, dur)
+        if not S.notifications or not Notify.gui then return end
+        local h = ensureHolder(Notify.gui)
+        local color = kind == "bad" and Theme.bad
+            or kind == "good" and Theme.good
+            or Theme.accent
+        local card = Instance.new("Frame")
+        card.Size = UDim2.new(1, 0, 0, 0)
+        card.AutomaticSize = Enum.AutomaticSize.Y
+        card.BackgroundColor3 = Theme.bg2
+        card.BackgroundTransparency = 1
+        card.Parent = h
+        local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0,8); cc.Parent = card
+        local strip = Instance.new("Frame")
+        strip.Size = UDim2.new(0, 4, 1, 0)
+        strip.BackgroundColor3 = color
+        strip.BorderSizePixel = 0
+        strip.Parent = card
+        local sc = Instance.new("UICorner"); sc.CornerRadius = UDim.new(0,8); sc.Parent = strip
+        local lbl = Instance.new("TextLabel")
+        lbl.BackgroundTransparency = 1
+        lbl.Position = UDim2.new(0, 14, 0, 0)
+        lbl.Size = UDim2.new(1, -22, 0, 0)
+        lbl.AutomaticSize = Enum.AutomaticSize.Y
+        lbl.Font = Enum.Font.GothamMedium
+        lbl.TextSize = 13
+        lbl.TextWrapped = true
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.TextColor3 = Theme.text
+        lbl.Text = text
+        lbl.Parent = card
+        local pad = Instance.new("UIPadding")
+        pad.PaddingTop = UDim.new(0,8); pad.PaddingBottom = UDim.new(0,8)
+        pad.Parent = card
+        -- fade in
+        TweenService:Create(card, TweenInfo.new(0.2), {BackgroundTransparency = 0.05}):Play()
+        task.delay(dur or 3, function()
+            local t = TweenService:Create(card, TweenInfo.new(0.25), {BackgroundTransparency = 1})
+            t:Play()
+            TweenService:Create(lbl, TweenInfo.new(0.25), {TextTransparency = 1}):Play()
+            t.Completed:Wait()
+            card:Destroy()
+        end)
+    end
+end
+
+--// ============================================================================
+--//  10. REMOTE SCANNER  — many "swing" games gate damage behind a RemoteEvent
+--//      rather than .Touched. We locate it once (cached) and fire it directly.
+--// ============================================================================
+local RemoteCache = { tool = nil, remote = nil }
+local function findRemote(tool)
+    if not tool then return nil end
+    if RemoteCache.tool == tool and RemoteCache.remote then
+        return RemoteCache.remote
+    end
+    local found
+    for _, d in ipairs(tool:GetDescendants()) do
+        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+            found = d
+            break
+        end
+    end
+    RemoteCache.tool = tool
+    RemoteCache.remote = found
+    return found
+end
+
+local function fireRemote(remote, entry)
+    if not remote then return end
+    -- classic sword remotes almost always want one of these shapes.
+    pcall(function() remote:FireServer(entry.hum) end)
+    pcall(function() remote:FireServer(entry.hrp) end)
+    pcall(function() remote:FireServer(entry.char) end)
+    pcall(function() remote:FireServer(entry.plr) end)
+    pcall(function() remote:FireServer("Slash", entry.hum) end)
+end
+
+--// ============================================================================
+--//  11. HIT PRIMITIVE  — stack touch-interests on the chosen parts.
+--//      hitParts lets us funnel all touches into HRP/Head for max DPS-per-cost.
+--// ============================================================================
+local function pickParts(entry)
+    if S.hitParts == "HRP" then
+        return { entry.hrp }
+    elseif S.hitParts == "Head" then
+        local head = entry.char and entry.char:FindFirstChild("Head")
+        return head and { head } or { entry.hrp }
+    end
+    return entry.parts
+end
+
+local function applyHits(handle, entry, hitCount)
+    if not S.dmgEnabled then return end
+    local parts = pickParts(entry)
+    for _ = 1, hitCount do
+        for _, p in ipairs(parts) do
+            if p then
+                Compat.fireTouch(handle, p, 0)
+                Compat.fireTouch(handle, p, 1)
+            end
+        end
+    end
+end
+
+--// ============================================================================
+--//  12. TARGET SCORING  — turn "who's in range" into "who dies first".
+--//      Higher score = handled first (and, for the top threat, harder).
+--// ============================================================================
+local function scoreEntry(e, dist)
+    local score = 0
+    -- proximity: closer = higher (inverse distance, normalized)
+    score = score + (1 - U.clamp(dist / math.max(S.reach, 1), 0, 1)) * 100
+
+    if S.priority == "Nearest" then
+        return score
+    elseif S.priority == "LowestHP" then
+        local hp = e.hum and e.hum.Health or 100
+        return score + (1000 - hp)     -- weakest first
+    elseif S.priority == "Threat" then
+        return score + (isFlagged(e.plr) and 5000 or 0)
+    else -- "Smart": attackers >> low hp >> near
+        if isFlagged(e.plr) then score = score + 5000 end
+        local hp = e.hum and e.hum.Health or 100
+        score = score + (1000 - hp) * 0.5
+        return score
+    end
+end
+
+--// ============================================================================
+--//  13. FOV / RANGE FILTER
+--// ============================================================================
+local function inRange(handle, e)
+    if not refreshEntry(e) then return false, math.huge end
+    local dist = (e.hrp.Position - handle.Position).Magnitude
+    if S.hitMode == "FOV" then
+        local sp, on = U.toScreen(e.hrp.Position)
+        if not on then return false, dist end
+        local center = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+        if (sp - center).Magnitude > S.fovRadius then return false, dist end
+        return true, dist
+    else
+        if dist > S.reach then return false, dist end
+    end
+    if S.wallCheck then
+        local myHrp = U.hrp(LocalPlayer)
+        if myHrp and not U.canSee(myHrp.Position, e.hrp, { U.char(LocalPlayer) }) then
+            return false, dist
+        end
+    end
+    return true, dist
+end
+
+--// ============================================================================
+--//  14. CORE ENGINE TICK  — the frame-budgeted combat pass.
+--//      Runs from multiple loops but self-limits by wall-clock so total work
+--//      per frame stays under S.frameBudgetMs -> no lag spikes.
+--// ============================================================================
+local Stats = { hits = 0, hitsThisSec = 0, hps = 0, targets = 0, kills = 0 }
+local _budgetStart, _sortBuf = 0, {}
+
+local function engineTick()
+    if not S.enabled or not S.dmgEnabled then return end
+    local handle, tool = U.handle()
+    if not handle then return end
+    if S.autoEquip and not tool then return end
+
+    local remote = S.remoteFire and findRemote(tool) or nil
+    _budgetStart = os.clock()
+
+    -- gather in-range enemies with scores (reuse buffer, no per-frame allocs)
+    table.clear(_sortBuf)
+    for _, e in ipairs(Cache.enemies) do
+        local ok, dist = inRange(handle, e)
+        if ok then
+            _sortBuf[#_sortBuf + 1] = { e = e, dist = dist, score = scoreEntry(e, dist) }
+        end
+    end
+    Stats.targets = #_sortBuf
+    if #_sortBuf == 0 then return end
+
+    -- highest score first
+    table.sort(_sortBuf, function(a, b) return a.score > b.score end)
+
+    local processed = 0
+    for _, item in ipairs(_sortBuf) do
+        if processed >= S.maxTargets then break end
+        -- frame budget guard: bail if we've spent too long this frame
+        if (os.clock() - _budgetStart) * 1000 >= S.frameBudgetMs then break end
+
+        local e = item.e
+        local hitCount = S.hits
+        if S.retaliate and isFlagged(e.plr) then
+            hitCount = S.hits * S.retalMultiplier   -- burst the aggressor
+        end
+
+        applyHits(handle, e, hitCount)
+        if remote then fireRemote(remote, e) end
+
+        Stats.hits = Stats.hits + hitCount
+        Stats.hitsThisSec = Stats.hitsThisSec + hitCount
+        processed = processed + 1
+    end
+end
+
+--// ============================================================================
+--//  15. AUTO-SWING + AUTO-EQUIP loops (own timer, not per-frame)
+--// ============================================================================
+local function startSwingLoop()
+    task.spawn(function()
+        while _G.APEX_REACH_LOADED do
+            if S.enabled and S.autoSwing then
+                local _, tool = U.handle()
+                if tool then pcall(function() tool:Activate() end) end
+            end
+            task.wait(1 / math.max(1, S.clickSpeed))
+        end
+    end)
+end
+
+local function startEquipLoop()
+    task.spawn(function()
+        while _G.APEX_REACH_LOADED do
+            if S.enabled and S.autoEquip then
+                local char = U.char(LocalPlayer)
+                if char and not char:FindFirstChildOfClass("Tool") then
+                    -- pull the first tool out of the backpack
+                    local bp = LocalPlayer:FindFirstChild("Backpack")
+                    local t = bp and bp:FindFirstChildOfClass("Tool")
+                    local hum = U.hum(LocalPlayer)
+                    if t and hum then pcall(function() hum:EquipTool(t) end) end
+                end
+            end
+            task.wait(0.4)
+        end
+    end)
+end
+
+--// ============================================================================
+--//  16. STATS / HPS COUNTER (1s tick)
+--// ============================================================================
+local function startStatsLoop()
+    task.spawn(function()
+        while _G.APEX_REACH_LOADED do
+            Stats.hps = Stats.hitsThisSec
+            Stats.hitsThisSec = 0
+            task.wait(1)
+        end
+    end)
+end
+
+--// ============================================================================
+--//  17. CACHE MAINTENANCE  — rebuild on a timer + on roster changes.
+--// ============================================================================
+local function startCacheLoop()
+    rebuildCache()
+    task.spawn(function()
+        while _G.APEX_REACH_LOADED do
+            if os.clock() - Cache.lastBuild >= S.cacheRefresh then
+                rebuildCache()
+            end
+            task.wait(S.cacheRefresh)
+        end
+    end)
+    bind(Players.PlayerAdded, function() task.wait(0.5); rebuildCache() end)
+    bind(Players.PlayerRemoving, function(p)
+        Retal.flagged[p] = nil
+        rebuildCache()
+    end)
+    -- re-arm self-damage watch + parts on respawn
+    bind(LocalPlayer.CharacterAdded, function()
+        task.wait(1)
+        rebuildCache()
+        watchSelfDamage()
+    end)
+end
+
+--// ============================================================================
+--//  18. ENGINE LOOP BINDINGS  — spread work across up to 3 loops.
+--//      Each loop calls engineTick(); the budget guard prevents overspend.
+--// ============================================================================
+local function startEngineLoops()
+    if S.useRender then
+        bind(RunService.RenderStepped, function() engineTick() end)
+    end
+    if S.useHeartbeat then
+        bind(RunService.Heartbeat, function() engineTick() end)
+    end
+    if S.useStepped then
+        bind(RunService.Stepped, function() engineTick() end)
+    end
+end
+
+--// ============================================================================
+--//  19. ESP  — box / tracer / name / health via the Drawing API when present.
+--//      Falls back silently if the executor has no Drawing library.
+--// ============================================================================
+local ESP = { objects = {}, supported = (typeof(Drawing) == "table") }
+
+local function newDrawing(class, props)
+    local d = Drawing.new(class)
+    for k, v in pairs(props) do d[k] = v end
+    return d
+end
+
+local function makeESP(entry)
+    if not ESP.supported then return nil end
+    return {
+        box    = newDrawing("Square", { Thickness = 1, Filled = false, Visible = false }),
+        name   = newDrawing("Text",   { Size = 13, Center = true, Outline = true, Visible = false }),
+        health = newDrawing("Line",   { Thickness = 2, Visible = false }),
+        tracer = newDrawing("Line",   { Thickness = 1, Visible = false }),
+    }
+end
+
+local function clearESP()
+    for _, o in pairs(ESP.objects) do
+        for _, d in pairs(o) do pcall(function() d:Remove() end) end
+    end
+    table.clear(ESP.objects)
+end
+
+local function updateESP()
+    if not ESP.supported then return end
+    if not S.espEnabled then
+        for _, o in pairs(ESP.objects) do
+            for _, d in pairs(o) do d.Visible = false end
+        end
+        return
+    end
+    -- ensure an object per current enemy
+    local live = {}
+    for _, e in ipairs(Cache.enemies) do
+        live[e.plr] = e
+        if not ESP.objects[e.plr] then
+            ESP.objects[e.plr] = makeESP(e)
+        end
+    end
+    for plr, o in pairs(ESP.objects) do
+        local e = live[plr]
+        if not e or not refreshEntry(e) then
+            for _, d in pairs(o) do d.Visible = false end
+        else
+            local col = S.espTeamColor and plr.TeamColor and plr.TeamColor.Color or S.espColor
+            local top, onTop    = U.toScreen(e.hrp.Position + Vector3.new(0, 3, 0))
+            local bot, _        = U.toScreen(e.hrp.Position - Vector3.new(0, 3, 0))
+            if onTop then
+                local h = math.abs(bot.Y - top.Y)
+                local w = h / 2
+                -- box
+                o.box.Visible   = S.espBoxes
+                o.box.Color     = col
+                o.box.Size      = Vector2.new(w, h)
+                o.box.Position  = Vector2.new(top.X - w/2, top.Y)
+                -- name
+                o.name.Visible  = S.espNames
+                o.name.Color    = col
+                o.name.Text     = plr.Name
+                o.name.Position = Vector2.new(top.X, top.Y - 16)
+                -- health bar (left of box)
+                if S.espHealth and e.hum then
+                    local frac = U.clamp(e.hum.Health / (e.hum.MaxHealth > 0 and e.hum.MaxHealth or 100), 0, 1)
+                    o.health.Visible = true
+                    o.health.Color   = Color3.fromRGB(255 - 255*frac, 255*frac, 60)
+                    o.health.From    = Vector2.new(top.X - w/2 - 4, bot.Y)
+                    o.health.To      = Vector2.new(top.X - w/2 - 4, bot.Y - h*frac)
+                else
+                    o.health.Visible = false
+                end
+                -- tracer from bottom-center of screen
+                if S.espTracers then
+                    o.tracer.Visible = true
+                    o.tracer.Color   = col
+                    o.tracer.From    = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y)
+                    o.tracer.To      = Vector2.new(top.X, bot.Y)
+                else
+                    o.tracer.Visible = false
+                end
+            else
+                for _, d in pairs(o) do d.Visible = false end
+            end
+        end
+    end
+end
+
+--// ============================================================================
+--//  20. FOV CIRCLE + REACH VISUALIZER
+--// ============================================================================
+local fovCircle
+local function updateFOVCircle()
+    if not ESP.supported then return end
+    if S.fovCircle and S.hitMode == "FOV" then
+        if not fovCircle then
+            fovCircle = newDrawing("Circle", { Thickness = 1.5, Filled = false, NumSides = 64 })
+        end
+        fovCircle.Visible  = true
+        fovCircle.Radius   = S.fovRadius
+        fovCircle.Position = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+        fovCircle.Color    = Theme.accent
+    elseif fovCircle then
+        fovCircle.Visible = false
+    end
+end
+
+local reachVis
+local function updateVisualizer()
+    local handle = U.handle()
+    if S.visualizer and handle and S.hitMode ~= "FOV" then
+        if not reachVis then
+            reachVis = Instance.new("Part")
+            reachVis.Anchored = true
+            reachVis.CanCollide = false
+            reachVis.CanTouch = false
+            reachVis.CanQuery = false
+            reachVis.Material = Enum.Material.ForceField
+            reachVis.Transparency = 0.6
+            reachVis.Shape = Enum.PartType.Ball
+            reachVis.Color = Theme.accent
+            reachVis.Parent = Workspace
+        end
+        local size = math.min(S.reach * 2, 2048) -- clamp visual so it doesn't nuke FPS
+        reachVis.Size = Vector3.new(size, size, size)
+        reachVis.CFrame = handle.CFrame
+        reachVis.Color = Theme.accent
+    elseif reachVis then
+        reachVis:Destroy(); reachVis = nil
+    end
+end
+
+local function startVisualLoop()
+    bind(RunService.RenderStepped, function()
+        updateESP()
+        updateFOVCircle()
+        updateVisualizer()
+    end)
+end
+
+--// ============================================================================
+--//  21. GUI LIBRARY  — a small, self-contained widget kit (tabs, sliders,
+--//      toggles, dropdowns, keybinds, buttons). Everything is theme-aware.
+--// ============================================================================
+local GUI = {}
+GUI.registry = {}   -- widgets that repaint on theme change
+
+local function corner(inst, r)
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 8); c.Parent = inst
+    return c
+end
+local function stroke(inst, col, th)
+    local s = Instance.new("UIStroke")
+    s.Color = col or Theme.bg3; s.Thickness = th or 1
+    s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    s.Parent = inst
+    return s
+end
+local function pad(inst, all)
+    local p = Instance.new("UIPadding")
+    p.PaddingTop = UDim.new(0, all); p.PaddingBottom = UDim.new(0, all)
+    p.PaddingLeft = UDim.new(0, all); p.PaddingRight = UDim.new(0, all)
+    p.Parent = inst
+    return p
+end
+
+-- root screengui ------------------------------------------------------------
+local screen = Instance.new("ScreenGui")
+screen.Name = "ApexReach_" .. tostring(math.random(1000, 9999))
+screen.ResetOnSpawn = false
+screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screen.IgnoreGuiInset = true
+-- guaranteed feedback the instant we execute, before any GUI is built
+pcall(function()
+    game:GetService("StarterGui"):SetCore("SendNotification", {
+        Title = "APEX REACH", Text = "loading v5...", Duration = 4,
+    })
+end)
+-- parent safely; if the chosen container ever fails, drop to PlayerGui
+do
+    local ok = pcall(function() screen.Parent = Compat.getgui() end)
+    if not ok or not screen.Parent then
+        pcall(function()
+            screen.Parent = LocalPlayer:WaitForChild("PlayerGui", 5)
+        end)
+    end
+end
+Notify.gui = screen
+
+-- main window ---------------------------------------------------------------
+local window = Instance.new("Frame")
+window.Name = "Window"
+window.Size = UDim2.new(0, 520, 0, 360)
+window.Position = UDim2.new(0.5, -260, 0.5, -180)
+window.BackgroundColor3 = Theme.bg
+window.BorderSizePixel = 0
+window.Active = true
+window.Draggable = true
+window.Parent = screen
+corner(window, 12)
+stroke(window, Theme.bg3, 1)
+
+-- header --------------------------------------------------------------------
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 44)
+header.BackgroundColor3 = Theme.bg2
+header.BorderSizePixel = 0
+header.Parent = window
+corner(header, 12)
+
+local logo = Instance.new("TextLabel")
+logo.BackgroundTransparency = 1
+logo.Position = UDim2.new(0, 16, 0, 0)
+logo.Size = UDim2.new(0.5, 0, 1, 0)
+logo.Font = Enum.Font.GothamBold
+logo.TextSize = 17
+logo.TextXAlignment = Enum.TextXAlignment.Left
+logo.TextColor3 = Theme.text
+logo.Text = "APEX REACH"
+logo.Parent = header
+
+local accentDot = Instance.new("Frame")
+accentDot.Size = UDim2.new(0, 8, 0, 8)
+accentDot.Position = UDim2.new(0, 8, 0.5, -4)
+accentDot.BackgroundColor3 = Theme.accent
+accentDot.Parent = header
+corner(accentDot, 4)
+logo.Position = UDim2.new(0, 22, 0, 0)
+
+local verLbl = Instance.new("TextLabel")
+verLbl.BackgroundTransparency = 1
+verLbl.Position = UDim2.new(0, 140, 0, 0)
+verLbl.Size = UDim2.new(0, 60, 1, 0)
+verLbl.Font = Enum.Font.Gotham
+verLbl.TextSize = 11
+verLbl.TextXAlignment = Enum.TextXAlignment.Left
+verLbl.TextColor3 = Theme.subtext
+verLbl.Text = "v5"
+verLbl.Parent = header
+
+-- close / minimize
+local function headerBtn(txt, xoff, col)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(0, 28, 0, 28)
+    b.Position = UDim2.new(1, xoff, 0.5, -14)
+    b.BackgroundColor3 = col or Theme.bg3
+    b.Text = txt
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+    b.TextColor3 = Theme.text
+    b.AutoButtonColor = true
+    b.Parent = header
+    corner(b, 8)
+    return b
+end
+local closeBtn = headerBtn("✕", -36, Theme.accent)
+local minBtn   = headerBtn("—", -70)
+
+-- sidebar (tab list) --------------------------------------------------------
+local sidebar = Instance.new("Frame")
+sidebar.Position = UDim2.new(0, 8, 0, 52)
+sidebar.Size = UDim2.new(0, 128, 1, -60)
+sidebar.BackgroundColor3 = Theme.bg2
+sidebar.BorderSizePixel = 0
+sidebar.Parent = window
+corner(sidebar, 10)
+local sideList = Instance.new("UIListLayout")
+sideList.Padding = UDim.new(0, 6)
+sideList.Parent = sidebar
+pad(sidebar, 8)
+
+-- content area --------------------------------------------------------------
+local content = Instance.new("Frame")
+content.Position = UDim2.new(0, 144, 0, 52)
+content.Size = UDim2.new(1, -152, 1, -60)
+content.BackgroundTransparency = 1
+content.Parent = window
+
+GUI.tabs = {}
+GUI.activeTab = nil
+
+-- tab factory ---------------------------------------------------------------
+function GUI.addTab(name, icon)
+    -- sidebar button
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 34)
+    btn.BackgroundColor3 = Theme.bg3
+    btn.BackgroundTransparency = 1
+    btn.Text = (icon and (icon .. "  ") or "") .. name
+    btn.Font = Enum.Font.GothamMedium
+    btn.TextSize = 13
+    btn.TextXAlignment = Enum.TextXAlignment.Left
+    btn.TextColor3 = Theme.subtext
+    btn.AutoButtonColor = false
+    btn.Parent = sidebar
+    corner(btn, 8)
+    local bpad = Instance.new("UIPadding"); bpad.PaddingLeft = UDim.new(0, 10); bpad.Parent = btn
+
+    -- scrolling page
+    local page = Instance.new("ScrollingFrame")
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 3
+    page.ScrollBarImageColor3 = Theme.accent
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.Visible = false
+    page.Parent = content
+    local pageList = Instance.new("UIListLayout")
+    pageList.Padding = UDim.new(0, 8)
+    pageList.SortOrder = Enum.SortOrder.LayoutOrder
+    pageList.Parent = page
+
+    local tab = { name = name, btn = btn, page = page }
+    GUI.tabs[#GUI.tabs + 1] = tab
+
+    btn.MouseButton1Click:Connect(function() GUI.selectTab(tab) end)
+
+    if not GUI.activeTab then GUI.selectTab(tab) end
+    return tab
+end
+
+function GUI.selectTab(tab)
+    for _, t in ipairs(GUI.tabs) do
+        local active = (t == tab)
+        t.page.Visible = active
+        TweenService:Create(t.btn, TweenInfo.new(0.15), {
+            BackgroundTransparency = active and 0 or 1,
+            TextColor3 = active and Theme.text or Theme.subtext,
+        }):Play()
+        t.btn.BackgroundColor3 = active and Theme.accent or Theme.bg3
+    end
+    GUI.activeTab = tab
+end
+
+-- section label -------------------------------------------------------------
+function GUI.section(tab, text)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -6, 0, 22)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.GothamBold
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextColor3 = Theme.accent2
+    lbl.Text = string.upper(text)
+    lbl.Parent = tab.page
+    return lbl
+end
+
+-- generic control container -------------------------------------------------
+local function controlFrame(tab, h)
+    local f = Instance.new("Frame")
+    f.Size = UDim2.new(1, -6, 0, h or 38)
+    f.BackgroundColor3 = Theme.bg2
+    f.BorderSizePixel = 0
+    f.Parent = tab.page
+    corner(f, 8)
+    return f
+end
+
+-- toggle --------------------------------------------------------------------
+function GUI.toggle(tab, label, key, callback)
+    local f = controlFrame(tab, 38)
+    local t = Instance.new("TextLabel")
+    t.BackgroundTransparency = 1
+    t.Position = UDim2.new(0, 12, 0, 0)
+    t.Size = UDim2.new(1, -70, 1, 0)
+    t.Font = Enum.Font.GothamMedium
+    t.TextSize = 13
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.TextColor3 = Theme.text
+    t.Text = label
+    t.Parent = f
+
+    local sw = Instance.new("TextButton")
+    sw.Size = UDim2.new(0, 44, 0, 22)
+    sw.Position = UDim2.new(1, -56, 0.5, -11)
+    sw.BackgroundColor3 = S[key] and Theme.accent or Theme.bg3
+    sw.Text = ""
+    sw.AutoButtonColor = false
+    sw.Parent = f
+    corner(sw, 11)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 18, 0, 18)
+    knob.Position = S[key] and UDim2.new(1, -20, 0.5, -9) or UDim2.new(0, 2, 0.5, -9)
+    knob.BackgroundColor3 = Color3.new(1, 1, 1)
+    knob.Parent = sw
+    corner(knob, 9)
+
+    local function render()
+        TweenService:Create(sw, TweenInfo.new(0.15), {
+            BackgroundColor3 = S[key] and Theme.accent or Theme.bg3
+        }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.15), {
+            Position = S[key] and UDim2.new(1, -20, 0.5, -9) or UDim2.new(0, 2, 0.5, -9)
+        }):Play()
+    end
+    sw.MouseButton1Click:Connect(function()
+        S[key] = not S[key]
+        render()
+        if callback then callback(S[key]) end
+    end)
+    return { set = function(v) S[key] = v; render() end }
+end
+
+-- slider (touch-friendly) ---------------------------------------------------
+function GUI.slider(tab, label, key, minV, maxV, opts)
+    opts = opts or {}
+    local logScale = opts.log        -- log scale for huge ranges (reach)
+    local decimals = opts.decimals or 0
+    local f = controlFrame(tab, 50)
+
+    local t = Instance.new("TextLabel")
+    t.BackgroundTransparency = 1
+    t.Position = UDim2.new(0, 12, 0, 4)
+    t.Size = UDim2.new(1, -24, 0, 18)
+    t.Font = Enum.Font.GothamMedium
+    t.TextSize = 13
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.TextColor3 = Theme.text
+    t.Parent = f
+
+    local track = Instance.new("Frame")
+    track.Position = UDim2.new(0, 12, 0, 30)
+    track.Size = UDim2.new(1, -24, 0, 8)
+    track.BackgroundColor3 = Theme.bg3
+    track.BorderSizePixel = 0
+    track.Parent = f
+    corner(track, 4)
+
+    local fill = Instance.new("Frame")
+    fill.BackgroundColor3 = Theme.accent
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+    corner(fill, 4)
+
+    local knob = Instance.new("TextButton")
+    knob.Size = UDim2.new(0, 18, 0, 18)
+    knob.BackgroundColor3 = Color3.new(1, 1, 1)
+    knob.Text = ""
+    knob.AutoButtonColor = false
+    knob.ZIndex = 3
+    knob.Parent = track
+    corner(knob, 9)
+
+    -- value <-> fraction converters (log-aware) -----------------------------
+    local function valToFrac(v)
+        if logScale then
+            local lo, hi = math.log(math.max(minV, 1)), math.log(maxV)
+            return U.clamp((math.log(math.max(v, minV)) - lo) / (hi - lo), 0, 1)
+        end
+        return U.clamp((v - minV) / (maxV - minV), 0, 1)
+    end
+    local function fracToVal(fr)
+        if logScale then
+            local lo, hi = math.log(math.max(minV, 1)), math.log(maxV)
+            return math.exp(lo + (hi - lo) * fr)
+        end
+        return minV + (maxV - minV) * fr
+    end
+
+    local function paint()
+        local fr = valToFrac(S[key])
+        fill.Size = UDim2.new(fr, 0, 1, 0)
+        knob.Position = UDim2.new(fr, -9, 0.5, -9)
+        local shown = decimals > 0 and U.round(S[key], decimals) or math.floor(S[key])
+        t.Text = label .. ":  " .. U.short(shown)
+    end
+    paint()
+
+    local dragging = false
+    local function setFromX(px)
+        local fr = U.clamp((px - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        S[key] = fracToVal(fr)
+        if decimals == 0 then S[key] = math.floor(S[key] + 0.5) end
+        paint()
+        if opts.callback then opts.callback(S[key]) end
+    end
+
+    knob.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+        end
+    end)
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = true; setFromX(i.Position.X)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            setFromX(i.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+
+    return { set = function(v) S[key] = v; paint() end, refresh = paint }
+end
+
+-- dropdown ------------------------------------------------------------------
+function GUI.dropdown(tab, label, key, options, callback)
+    local f = controlFrame(tab, 38)
+    local t = Instance.new("TextLabel")
+    t.BackgroundTransparency = 1
+    t.Position = UDim2.new(0, 12, 0, 0)
+    t.Size = UDim2.new(0.5, 0, 1, 0)
+    t.Font = Enum.Font.GothamMedium
+    t.TextSize = 13
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.TextColor3 = Theme.text
+    t.Text = label
+    t.Parent = f
+
+    local sel = Instance.new("TextButton")
+    sel.Size = UDim2.new(0, 150, 0, 26)
+    sel.Position = UDim2.new(1, -162, 0.5, -13)
+    sel.BackgroundColor3 = Theme.bg3
+    sel.Font = Enum.Font.GothamMedium
+    sel.TextSize = 12
+    sel.TextColor3 = Theme.accent2
+    sel.Text = tostring(S[key]) .. "  ▾"
+    sel.Parent = f
+    corner(sel, 6)
+
+    local open = false
+    local menu = Instance.new("Frame")
+    menu.BackgroundColor3 = Theme.bg3
+    menu.Position = UDim2.new(1, -162, 0.5, 16)
+    menu.Size = UDim2.new(0, 150, 0, #options * 26)
+    menu.Visible = false
+    menu.ZIndex = 5
+    menu.Parent = f
+    corner(menu, 6)
+    local ml = Instance.new("UIListLayout"); ml.Parent = menu
+
+    for _, opt in ipairs(options) do
+        local o = Instance.new("TextButton")
+        o.Size = UDim2.new(1, 0, 0, 26)
+        o.BackgroundTransparency = 1
+        o.Font = Enum.Font.Gotham
+        o.TextSize = 12
+        o.TextColor3 = Theme.text
+        o.Text = tostring(opt)
+        o.ZIndex = 6
+        o.Parent = menu
+        o.MouseButton1Click:Connect(function()
+            S[key] = opt
+            sel.Text = tostring(opt) .. "  ▾"
+            open = false; menu.Visible = false
+            if callback then callback(opt) end
+        end)
+    end
+    sel.MouseButton1Click:Connect(function()
+        open = not open; menu.Visible = open
+        f.ZIndex = open and 10 or 1
+    end)
+    return { set = function(v) S[key] = v; sel.Text = tostring(v) .. "  ▾" end }
+end
+
+-- button --------------------------------------------------------------------
+function GUI.button(tab, label, callback)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.new(1, -6, 0, 34)
+    b.BackgroundColor3 = Theme.accent
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 13
+    b.TextColor3 = Theme.text
+    b.Text = label
+    b.AutoButtonColor = true
+    b.Parent = tab.page
+    corner(b, 8)
+    b.MouseButton1Click:Connect(function() if callback then callback() end end)
+    return b
+end
+
+-- keybind picker ------------------------------------------------------------
+function GUI.keybind(tab, label, key, callback)
+    local f = controlFrame(tab, 38)
+    local t = Instance.new("TextLabel")
+    t.BackgroundTransparency = 1
+    t.Position = UDim2.new(0, 12, 0, 0)
+    t.Size = UDim2.new(0.6, 0, 1, 0)
+    t.Font = Enum.Font.GothamMedium
+    t.TextSize = 13
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.TextColor3 = Theme.text
+    t.Text = label
+    t.Parent = f
+
+    local bindBtn = Instance.new("TextButton")
+    bindBtn.Size = UDim2.new(0, 120, 0, 26)
+    bindBtn.Position = UDim2.new(1, -132, 0.5, -13)
+    bindBtn.BackgroundColor3 = Theme.bg3
+    bindBtn.Font = Enum.Font.GothamMedium
+    bindBtn.TextSize = 12
+    bindBtn.TextColor3 = Theme.accent2
+    bindBtn.Text = tostring(S[key]):gsub("Enum.KeyCode.", "")
+    bindBtn.Parent = f
+    corner(bindBtn, 6)
+
+    local listening = false
+    bindBtn.MouseButton1Click:Connect(function()
+        listening = true
+        bindBtn.Text = "press a key..."
+    end)
+    UserInputService.InputBegan:Connect(function(input, gpe)
+        if listening and input.KeyCode ~= Enum.KeyCode.Unknown then
+            S[key] = input.KeyCode
+            bindBtn.Text = tostring(input.KeyCode):gsub("Enum.KeyCode.", "")
+            listening = false
+            if callback then callback(input.KeyCode) end
+        end
+    end)
+    return { set = function(v) S[key] = v; bindBtn.Text = tostring(v):gsub("Enum.KeyCode.", "") end }
+end
+
+-- label / paragraph ---------------------------------------------------------
+function GUI.label(tab, text)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -6, 0, 0)
+    l.AutomaticSize = Enum.AutomaticSize.Y
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.Gotham
+    l.TextSize = 12
+    l.TextWrapped = true
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextColor3 = Theme.subtext
+    l.Text = text
+    l.Parent = tab.page
+    return l
+end
+
+-- live stat readout (auto-updating) -----------------------------------------
+function GUI.stat(tab, label, getter)
+    local f = controlFrame(tab, 30)
+    local t = Instance.new("TextLabel")
+    t.BackgroundTransparency = 1
+    t.Position = UDim2.new(0, 12, 0, 0)
+    t.Size = UDim2.new(0.6, 0, 1, 0)
+    t.Font = Enum.Font.GothamMedium
+    t.TextSize = 12
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.TextColor3 = Theme.subtext
+    t.Text = label
+    t.Parent = f
+    local v = Instance.new("TextLabel")
+    v.BackgroundTransparency = 1
+    v.Position = UDim2.new(0.5, 0, 0, 0)
+    v.Size = UDim2.new(0.5, -12, 1, 0)
+    v.Font = Enum.Font.GothamBold
+    v.TextSize = 12
+    v.TextXAlignment = Enum.TextXAlignment.Right
+    v.TextColor3 = Theme.accent2
+    v.Text = "-"
+    v.Parent = f
+    bind(RunService.Heartbeat, function()
+        v.Text = tostring(getter())
+    end)
+    return v
+end
+
+--// ============================================================================
+--//  22. ON-SCREEN HUD  — compact combat readout (top-left), independent of menu
+--// ============================================================================
+local HUD = {}
+do
+    local frame = Instance.new("Frame")
+    frame.Name = "HUD"
+    frame.Position = UDim2.new(0, 12, 0, 12)
+    frame.Size = UDim2.new(0, 168, 0, 92)
+    frame.BackgroundColor3 = Theme.bg
+    frame.BackgroundTransparency = 0.15
+    frame.BorderSizePixel = 0
+    frame.Visible = S.showHUD
+    frame.Active = true
+    frame.Draggable = true
+    frame.Parent = screen
+    corner(frame, 10)
+    stroke(frame, Theme.accent, 1)
+
+    local title = Instance.new("TextLabel")
+    title.BackgroundTransparency = 1
+    title.Position = UDim2.new(0, 10, 0, 6)
+    title.Size = UDim2.new(1, -20, 0, 16)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 12
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.TextColor3 = Theme.accent2
+    title.Text = "APEX · ACTIVE"
+    title.Parent = frame
+
+    local function row(y, name)
+        local n = Instance.new("TextLabel")
+        n.BackgroundTransparency = 1
+        n.Position = UDim2.new(0, 10, 0, y)
+        n.Size = UDim2.new(0.55, 0, 0, 14)
+        n.Font = Enum.Font.Gotham
+        n.TextSize = 11
+        n.TextXAlignment = Enum.TextXAlignment.Left
+        n.TextColor3 = Theme.subtext
+        n.Text = name
+        n.Parent = frame
+        local v = Instance.new("TextLabel")
+        v.BackgroundTransparency = 1
+        v.Position = UDim2.new(0.45, 0, 0, y)
+        v.Size = UDim2.new(0.55, -10, 0, 14)
+        v.Font = Enum.Font.GothamBold
+        v.TextSize = 11
+        v.TextXAlignment = Enum.TextXAlignment.Right
+        v.TextColor3 = Theme.text
+        v.Text = "-"
+        v.Parent = frame
+        return v
+    end
+    local vReach   = row(26, "reach")
+    local vTargets = row(42, "targets")
+    local vHPS     = row(58, "hits/sec")
+    local vMode    = row(74, "mode")
+
+    bind(RunService.Heartbeat, function()
+        frame.Visible = S.showHUD
+        if not S.showHUD then return end
+        title.Text = S.enabled and "APEX · ACTIVE" or "APEX · PAUSED"
+        title.TextColor3 = S.enabled and Theme.good or Theme.bad
+        vReach.Text   = U.short(S.reach)
+        vTargets.Text = tostring(Stats.targets)
+        vHPS.Text     = U.short(Stats.hps)
+        vMode.Text    = S.priority
+    end)
+    HUD.frame = frame
+end
+
+--// ============================================================================
+--//  23. CONFIG SAVE / LOAD  (only if the executor exposes file APIs)
+--// ============================================================================
+local CONFIG_FILE = "apex_reach_config.json"
+local SAVE_KEYS = {
+    "reach","hits","dmgEnabled","hitMode","fovRadius","hitParts","priority",
+    "teamCheck","wallCheck","maxTargets","retaliate","retalMultiplier",
+    "retalWindow","autoSwing","clickSpeed","autoEquip","remoteFire",
+    "frameBudgetMs","useRender","useHeartbeat","useStepped","cacheRefresh",
+    "espEnabled","espBoxes","espTracers","espNames","espHealth","visualizer",
+    "fovCircle","theme","notifications","showHUD",
+}
+local function saveConfig()
+    if not Compat.writefile then
+        Notify.push("This executor can't save files.", "bad")
+        return
+    end
+    local out = {}
+    for _, k in ipairs(SAVE_KEYS) do out[k] = S[k] end
+    local ok, json = pcall(function() return HttpService:JSONEncode(out) end)
+    if ok then
+        pcall(Compat.writefile, CONFIG_FILE, json)
+        Notify.push("Config saved.", "good")
+    end
+end
+local function loadConfig()
+    if not Compat.readfile or not Compat.isfile then return end
+    if not Compat.isfile(CONFIG_FILE) then return end
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(Compat.readfile(CONFIG_FILE))
+    end)
+    if ok and type(data) == "table" then
+        for _, k in ipairs(SAVE_KEYS) do
+            if data[k] ~= nil then S[k] = data[k] end
+        end
+        Notify.push("Config loaded.", "good")
+    end
+end
+
+--// ============================================================================
+--//  24. BUILD THE TABS
+--// ============================================================================
+
+-- ---- COMBAT ---------------------------------------------------------------
+local combatTab = GUI.addTab("Combat", "⚔")
+GUI.section(combatTab, "Reach Engine")
+GUI.toggle(combatTab, "Enabled (master)", "enabled", function(v)
+    Notify.push(v and "Reach ON" or "Reach OFF", v and "good" or "bad")
+end)
+GUI.toggle(combatTab, "Deal Damage", "dmgEnabled")
+GUI.slider(combatTab, "Reach", "reach", 5, S.maxReach, { log = true, callback = function(v)
+end })
+GUI.slider(combatTab, "Hits / Frame (DPS)", "hits", 1, S.maxHits)
+GUI.dropdown(combatTab, "Hit Mode", "hitMode", { "Sphere", "Line", "FOV" })
+GUI.dropdown(combatTab, "Hit Parts", "hitParts", { "All", "HRP", "Head" })
+GUI.slider(combatTab, "FOV Radius (px)", "fovRadius", 40, 700)
+
+GUI.section(combatTab, "Swing")
+GUI.toggle(combatTab, "Auto Swing", "autoSwing")
+GUI.slider(combatTab, "Swing Speed (/s)", "clickSpeed", 5, 120)
+GUI.toggle(combatTab, "Auto Equip Sword", "autoEquip")
+GUI.toggle(combatTab, "Fire Damage Remote", "remoteFire")
+
+-- ---- TARGETING ------------------------------------------------------------
+local targetTab = GUI.addTab("Target", "◎")
+GUI.section(targetTab, "Priority")
+GUI.dropdown(targetTab, "Target Priority", "priority",
+    { "Smart", "Nearest", "LowestHP", "Threat" })
+GUI.label(targetTab, "Smart = attackers first, then weakest, then nearest. This is what beats other reachers — the one hitting you dies first.")
+GUI.slider(targetTab, "Max Targets / Frame", "maxTargets", 1, 20)
+GUI.toggle(targetTab, "Team Check (skip mates)", "teamCheck")
+GUI.toggle(targetTab, "Wall Check (line-of-sight)", "wallCheck")
+
+GUI.section(targetTab, "Retaliation")
+GUI.toggle(targetTab, "Retaliate vs Reachers", "retaliate", function(v)
+    Notify.push(v and "Retaliation armed" or "Retaliation off", v and "good" or nil)
+end)
+GUI.slider(targetTab, "Retaliation Power (x)", "retalMultiplier", 1, 8)
+GUI.slider(targetTab, "Aggressor Memory (s)", "retalWindow", 0.2, 4, { decimals = 1 })
+GUI.label(targetTab, "When you take damage, nearby armed enemies get flagged and hit with x times the touches — so you out-trade anyone reaching you.")
+
+-- ---- VISUALS --------------------------------------------------------------
+local visualTab = GUI.addTab("Visuals", "◈")
+GUI.section(visualTab, "ESP")
+GUI.toggle(visualTab, "Enable ESP", "espEnabled")
+GUI.toggle(visualTab, "Boxes", "espBoxes")
+GUI.toggle(visualTab, "Names", "espNames")
+GUI.toggle(visualTab, "Health Bars", "espHealth")
+GUI.toggle(visualTab, "Tracers", "espTracers")
+GUI.toggle(visualTab, "Use Team Color", "espTeamColor")
+
+GUI.section(visualTab, "Reach Feedback")
+GUI.toggle(visualTab, "Reach Visualizer", "visualizer")
+GUI.toggle(visualTab, "FOV Circle", "fovCircle")
+if not ESP.supported then
+    GUI.label(visualTab, "Note: this executor has no Drawing API, so ESP/FOV visuals are disabled. The engine still works fully.")
+end
+
+-- ---- PERFORMANCE ----------------------------------------------------------
+local perfTab = GUI.addTab("Perf", "⚡")
+GUI.section(perfTab, "Frame Budget")
+GUI.slider(perfTab, "Max ms / Frame", "frameBudgetMs", 1, 12, { decimals = 1 })
+GUI.label(perfTab, "The engine stops hitting once it spends this many ms in a frame. Lower = smoother FPS, higher = more raw DPS. 4ms is the sweet spot.")
+GUI.slider(perfTab, "Cache Refresh (s)", "cacheRefresh", 0.1, 2, { decimals = 2 })
+
+GUI.section(perfTab, "Engine Loops")
+GUI.toggle(perfTab, "RenderStepped loop", "useRender", function() Notify.push("Reload to apply loop changes.") end)
+GUI.toggle(perfTab, "Heartbeat loop", "useHeartbeat", function() Notify.push("Reload to apply loop changes.") end)
+GUI.toggle(perfTab, "Stepped loop (extra DPS)", "useStepped", function() Notify.push("Reload to apply loop changes.") end)
+GUI.label(perfTab, "More loops = more hits/sec but more CPU. If you lag, keep only Heartbeat on.")
+
+GUI.section(perfTab, "Live Stats")
+GUI.stat(perfTab, "Targets in range", function() return Stats.targets end)
+GUI.stat(perfTab, "Hits / second", function() return U.short(Stats.hps) end)
+GUI.stat(perfTab, "Total hits", function() return U.short(Stats.hits) end)
+GUI.stat(perfTab, "FPS", function() return math.floor(1 / RunService.RenderStepped:Wait()) end)
+
+-- ---- SETTINGS -------------------------------------------------------------
+local setTab = GUI.addTab("Settings", "⚙")
+GUI.section(setTab, "Appearance")
+GUI.dropdown(setTab, "Theme", "theme", { "Crimson", "Void", "Toxic", "Ocean", "Mono" },
+    function(name) Notify.push("Theme set to " .. name .. ". Reload to fully apply.") end)
+GUI.toggle(setTab, "Show HUD", "showHUD")
+GUI.toggle(setTab, "Notifications", "notifications")
+
+GUI.section(setTab, "Keybinds")
+GUI.keybind(setTab, "Toggle Menu", "menuKey")
+GUI.keybind(setTab, "Panic (disable all)", "panicKey")
+
+GUI.section(setTab, "Config")
+GUI.button(setTab, "Save Config", saveConfig)
+GUI.button(setTab, "Load Config", function() loadConfig(); Notify.push("Reload script to refresh GUI from config.") end)
+GUI.button(setTab, "Unload APEX", function() _G.APEX_REACH_UNLOAD() end)
+GUI.label(setTab, "APEX REACH v5 — universal sword reach with retaliation targeting. Built to win the duel.")
+
+--// ============================================================================
+--//  25. FLOATING OPEN BUTTON + WINDOW SHOW/HIDE
+--// ============================================================================
+local openBtn = Instance.new("TextButton")
+openBtn.Size = UDim2.new(0, 74, 0, 34)
+openBtn.Position = UDim2.new(0, 12, 0, 120)
+openBtn.BackgroundColor3 = Theme.accent
+openBtn.Text = "APEX"
+openBtn.Font = Enum.Font.GothamBold
+openBtn.TextSize = 14
+openBtn.TextColor3 = Theme.text
+openBtn.Visible = false
+openBtn.Active = true
+openBtn.Draggable = true
+openBtn.Parent = screen
+corner(openBtn, 8)
+stroke(openBtn, Theme.accent2, 1)
+
+local function setMenu(open)
+    window.Visible = open
+    openBtn.Visible = not open
+end
+closeBtn.MouseButton1Click:Connect(function() setMenu(false) end)
+openBtn.MouseButton1Click:Connect(function() setMenu(true) end)
+
+-- minimize collapses to just the header
+local minimized = false
+local savedSize = window.Size
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    if minimized then
+        savedSize = window.Size
+        TweenService:Create(window, TweenInfo.new(0.2), { Size = UDim2.new(0, 520, 0, 44) }):Play()
+        sidebar.Visible = false; content.Visible = false
+    else
+        TweenService:Create(window, TweenInfo.new(0.2), { Size = savedSize }):Play()
+        task.wait(0.15)
+        sidebar.Visible = true; content.Visible = true
+    end
+end)
+
+--// ============================================================================
+--//  26. KEYBINDS  — menu toggle + panic disable
+--// ============================================================================
+bind(UserInputService.InputBegan, function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == S.menuKey then
+        setMenu(not window.Visible)
+    elseif input.KeyCode == S.panicKey then
+        S.enabled = false
+        S.espEnabled = false
+        S.visualizer = false
+        Notify.push("PANIC — everything disabled.", "bad")
+    end
+end)
+
+--// ============================================================================
+--//  27. UNLOAD  — full teardown, no leftovers, no leaked connections.
+--// ============================================================================
+_G.APEX_REACH_UNLOAD = function()
+    _G.APEX_REACH_LOADED = false
+    unbindAll()
+    clearESP()
+    if fovCircle then pcall(function() fovCircle:Remove() end) end
+    if reachVis then pcall(function() reachVis:Destroy() end) end
+    pcall(function() screen:Destroy() end)
+    pcall(function() Notify.push("APEX unloaded.") end)
+end
+
+--// ============================================================================
+--//  28. INIT  — wire everything up and go live.
+--// ============================================================================
+local function init()
+    loadConfig()          -- pull saved settings if present
+    watchSelfDamage()     -- arm retaliation
+    startCacheLoop()      -- build + maintain enemy cache
+    startEngineLoops()    -- the reach engine (render/heartbeat/stepped)
+    startSwingLoop()      -- auto-swing timer
+    startEquipLoop()      -- auto-equip timer
+    startStatsLoop()      -- hits/sec counter
+    startVisualLoop()     -- ESP / FOV / visualizer render
+
+    setMenu(true)
+    Notify.push("APEX REACH v5 loaded. Priority: " .. S.priority, "good", 4)
+    Notify.push("Tip: keep 'Retaliate' ON to beat other reachers.", nil, 5)
+end
+
+-- run init with error surfacing so we never "silently do nothing"
+local okInit, errInit = pcall(init)
+if not okInit then
+    warn("[APEX] init error: " .. tostring(errInit))
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "APEX ERROR", Text = tostring(errInit), Duration = 10,
+        })
+    end)
+end
+
+--[[
+================================================================================
+  QUICK REFERENCE
+--------------------------------------------------------------------------------
+  · Master switch ......... Combat tab → "Enabled"
+  · Set reach ............. Combat tab → "Reach" slider (log scale, 5 → 2M)
+  · More DPS .............. Combat tab → "Hits / Frame" slider
+  · Beat other reachers ... Target tab → "Retaliate" ON + "Priority = Smart"
+  · Stop lag .............. Perf tab → lower "Max ms / Frame" to 2-3
+  · Toggle menu ........... RightShift (rebindable in Settings)
+  · Panic off ............. RightControl
+  · Unload ................ Settings tab → "Unload APEX"
+================================================================================
+]]
