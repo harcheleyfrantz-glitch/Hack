@@ -1,0 +1,600 @@
+--[[==================================================================
+    MM4 AUTO ANIMATOR — v3  (standalone GUI tool, single R15 character)
+    ------------------------------------------------------------------
+    HOW TO USE:
+      1. Join Movie Maker 4. Stay on the title screen — DO NOT open the editor.
+      2. Execute this script in Delta.
+      3. A window appears. Type a PROJECT NAME, pick a preset, hit BUILD.
+      4. The tool creates a fresh movie, names it, and lays down real frames
+         one at a time (human-paced) so it looks hand-made. Progress + ETA
+         are shown live. It auto-saves when done.
+
+    WHY IT WORKS WITHOUT THE EDITOR:
+      Frames are just pose tables (world-space CFrames per part) pushed through
+      ReplicatedStorage.MovieNet. We embed a real neutral R15 pose captured from
+      your dump, so we don't need the live rig in Workspace to author frames.
+      If the live rig IS present, we refresh colors/sizes/pose from it.
+
+    PROTOCOL (from your captures):
+      MovieNet.RequestNewMovie()            -> blank movie (frame 1 exists)
+      MovieNet.SetMetadata({title=...})     -> names the project
+      MovieNet.SetSettings({fps,scenery..}) -> movie settings
+      MovieNet.OverwriteFrame(i, pose)      -> replace frame i
+      MovieNet.InsertAfter(i, pose)         -> insert after i, returns {total,interval..}
+      MovieNet.SaveMovie() / PublishMovie() -> persist / publish
+==================================================================]]
+
+-------------------------------------------------------------------
+-- EMBEDDED NEUTRAL BASE POSE  (R15 Noob, right arm normalized)
+-------------------------------------------------------------------
+local BASE_POSE = {
+	["R15 Noob.LowerTorso"] = { cf={-0.0, 12.702983, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={2.0, 0.400101, 1.0} },
+	["R15 Noob.UpperTorso"] = { cf={-0.0, 13.702996, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.129412, 0.329412, 0.72549}, size={2.0, 1.6, 1.0} },
+	["R15 Noob.UpperTorso.PivotPart"] = { cf={-1e-05, 12.902966, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.Head"] = { cf={-0.0, 15.003016, 0.000273, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.960784, 0.803922, 0.188235}, size={1.19784, 1.2024, 1.197901} },
+	["R15 Noob.Head.PivotPart"] = { cf={-0.000368, 14.499536, 2e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftUpperArm"] = { cf={-1.500003, 13.871687, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.960784, 0.803922, 0.188235}, size={1.0, 1.168699, 1.0} },
+	["R15 Noob.LeftUpperArm.PivotPart"] = { cf={-0.999992, 14.099492, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftLowerArm"] = { cf={-1.500003, 13.278944, 4e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 1.051899, 1.0} },
+	["R15 Noob.LeftLowerArm.PivotPart"] = { cf={-1.5, 13.537314, -4e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftHand"] = { cf={-1.500003, 12.652966, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 0.3001, 1.0} },
+	["R15 Noob.LeftHand.PivotPart"] = { cf={-1.5, 12.782969, -4e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightUpperArm"] = { cf={1.500003, 13.871687, -0.0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.960784, 0.803922, 0.188235}, size={1.0, 1.168699, 1.0} },
+	["R15 Noob.RightUpperArm.PivotPart"] = { cf={0.999992, 14.099492, -0.0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightLowerArm"] = { cf={1.500003, 13.278944, 4e-06, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.498039, 0.498039, 0.498039}, size={1.0, 1.051899, 1.0} },
+	["R15 Noob.RightLowerArm.PivotPart"] = { cf={1.5, 13.537314, -4e-06, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightHand"] = { cf={1.500003, 12.652966, -0.0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.498039, 0.498039, 0.498039}, size={1.0, 0.3001, 1.0} },
+	["R15 Noob.RightHand.PivotPart"] = { cf={1.5, 12.782969, -4e-06, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftUpperLeg"] = { cf={-0.500001, 12.082227, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.294118, 0.592157, 0.294118}, size={1.0, 1.2166, 0.999899} },
+	["R15 Noob.LeftUpperLeg.PivotPart"] = { cf={-0.500011, 12.50311, -4e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftLowerLeg"] = { cf={-0.500001, 11.302105, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 1.1931, 1.0} },
+	["R15 Noob.LeftLowerLeg.PivotPart"] = { cf={-0.500027, 11.67413, -8e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftFoot"] = { cf={-0.500001, 10.649539, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 0.299999, 1.0} },
+	["R15 Noob.LeftFoot.PivotPart"] = { cf={-0.500009, 10.799531, 0.000561, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightUpperLeg"] = { cf={0.500001, 12.082227, 4.8e-05, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.294118, 0.592157, 0.294118}, size={1.0, 1.2166, 0.999899} },
+	["R15 Noob.RightUpperLeg.PivotPart"] = { cf={0.499986, 12.502887, -2e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightLowerLeg"] = { cf={0.500001, 11.302105, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 1.1931, 1.0} },
+	["R15 Noob.RightLowerLeg.PivotPart"] = { cf={0.499986, 11.673919, -4e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightFoot"] = { cf={0.500001, 10.653007, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 0.299999, 1.0} },
+	["R15 Noob.RightFoot.PivotPart"] = { cf={0.499986, 10.799537, 0.000553, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["Camera.CameraPart"] = { cf={-0.206215, 15.695602, -18.375015, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0}, color={0.639216, 0.635294, 0.647059}, size={3.489182, 2.364506, 3.017387} },
+}
+
+-------------------------------------------------------------------
+-- CONFIG
+-------------------------------------------------------------------
+local CFG = {
+	modelName = "R15 Noob",
+	settings  = { skybox="Default", timeOfDay="14:30:00", cameraFOV="40",
+	              scenery="Default", tweening=true, cameraTweening=true, fps=12 },
+}
+local SPEEDS = {   -- per-frame authoring delay (seconds) -> the "human" pacing
+	{ id="fast",       label="Fast",       min=0.05, max=0.12 },
+	{ id="human",      label="Human",      min=0.9,  max=1.9  },
+	{ id="meticulous", label="Meticulous", min=2.0,  max=3.6  },
+}
+
+-------------------------------------------------------------------
+-- SERVICES / REMOTES
+-------------------------------------------------------------------
+local RS      = game:GetService("ReplicatedStorage")
+local UIS     = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+
+local MovieNet = RS:WaitForChild("MovieNet", 10)
+local RF = {}
+for _, name in ipairs({"RequestNewMovie","OverwriteFrame","InsertAfter","SetSettings",
+                       "SetMetadata","AddEffect","SaveMovie","PublishMovie"}) do
+	RF[name] = MovieNet and MovieNet:FindFirstChild(name)
+end
+local function invoke(name, ...)
+	local rf = RF[name]
+	if not rf then warn("[MM4] missing remote: "..name); return false end
+	local a = {...}
+	local ok, res = pcall(function() return rf:InvokeServer(table.unpack(a)) end)
+	if not ok then warn("[MM4] "..name.." failed: "..tostring(res)) end
+	return ok, res
+end
+
+-------------------------------------------------------------------
+-- POSE MODEL  (short-keyed CFrame snapshots + metadata)
+-------------------------------------------------------------------
+local PREFIX = CFG.modelName .. "."
+local BASECF, BASEMETA = {}, {}          -- short -> CFrame ; short -> {color,size}
+local function cfFromArr(a) return CFrame.new(table.unpack(a)) end
+local function shortKey(full)
+	if full == "Camera.CameraPart" then return "__CameraPart" end
+	if full:sub(1, #PREFIX) == PREFIX then return full:sub(#PREFIX + 1) end
+	return full
+end
+local function fullKey(short)
+	if short == "__CameraPart" then return "Camera.CameraPart" end
+	return PREFIX .. short
+end
+for full, v in pairs(BASE_POSE) do
+	local s = shortKey(full)
+	BASECF[s]   = cfFromArr(v.cf)
+	BASEMETA[s] = { color = v.color, size = v.size }
+end
+
+-- optional: refresh base from the live rig if it exists (colors/sizes/pose)
+local function refreshFromLive()
+	local model
+	for _, folder in ipairs(workspace:GetChildren()) do
+		if folder:IsA("Folder") and folder:FindFirstChild("Models") then
+			local m = folder.Models:FindFirstChild(CFG.modelName)
+			if m then model = m break end
+		end
+	end
+	if not model then return false end
+	for short in pairs(BASECF) do
+		if short ~= "__CameraPart" then
+			local pname, sub = short:match("^(.-)%.PivotPart$"), nil
+			local part
+			if pname then
+				local p = model:FindFirstChild(pname); part = p and p:FindFirstChild("PivotPart")
+			else
+				part = model:FindFirstChild(short)
+			end
+			if part then
+				BASECF[short]   = part.CFrame
+				BASEMETA[short] = { color = {part.Color.R, part.Color.G, part.Color.B},
+				                    size  = {part.Size.X, part.Size.Y, part.Size.Z} }
+			end
+		end
+	end
+	return true
+end
+
+local function snapshot()          -- fresh working copy of base CFrames
+	local s = {}
+	for k, cf in pairs(BASECF) do s[k] = cf end
+	return s
+end
+
+local function buildPoseTable(snap)
+	local pose = {}
+	for short, cf in pairs(snap) do
+		local meta = BASEMETA[short]
+		pose[fullKey(short)] = { cf = { cf:GetComponents() }, color = meta.color, size = meta.size }
+	end
+	return pose
+end
+
+-------------------------------------------------------------------
+-- FK HELPERS
+-------------------------------------------------------------------
+local RIG = {
+	subtree = {
+		UpperBody     = {"UpperTorso","Head","LeftUpperArm","LeftLowerArm","LeftHand",
+		                 "RightUpperArm","RightLowerArm","RightHand"},
+		RightUpperArm = {"RightUpperArm","RightLowerArm","RightHand"},
+		LeftUpperArm  = {"LeftUpperArm","LeftLowerArm","LeftHand"},
+		RightLowerArm = {"RightLowerArm","RightHand"},
+		LeftLowerArm  = {"LeftLowerArm","LeftHand"},
+		RightUpperLeg = {"RightUpperLeg","RightLowerLeg","RightFoot"},
+		LeftUpperLeg  = {"LeftUpperLeg","LeftLowerLeg","LeftFoot"},
+		RightLowerLeg = {"RightLowerLeg","RightFoot"},
+		LeftLowerLeg  = {"LeftLowerLeg","LeftFoot"},
+	},
+}
+local function jointPivot(snap, owner)
+	local pk = owner .. ".PivotPart"
+	if snap[pk] then return snap[pk].Position end
+	if snap[owner] then return snap[owner].Position end
+	return Vector3.new()
+end
+local function rotateSubtree(snap, parts, pivot, rot)
+	if not rot then return end
+	local T = CFrame.new(pivot) * rot * CFrame.new(pivot):Inverse()
+	for _, n in ipairs(parts) do
+		if snap[n] then snap[n] = T * snap[n] end
+		local pk = n .. ".PivotPart"
+		if snap[pk] then snap[pk] = T * snap[pk] end
+	end
+end
+local function translateAll(snap, v)
+	for k, cf in pairs(snap) do
+		if k ~= "__CameraPart" then snap[k] = cf + v end
+	end
+end
+local rad = math.rad
+-- order: lean -> shoulders -> elbows -> hips -> knees -> body translate
+local function applyParams(prm)
+	local s = snapshot()
+	if prm.lean and prm.lean ~= 0 then
+		rotateSubtree(s, RIG.subtree.UpperBody, jointPivot(s,"UpperTorso"), CFrame.Angles(prm.lean,0,0))
+	end
+	rotateSubtree(s, RIG.subtree.RightUpperArm, jointPivot(s,"RightUpperArm"), CFrame.Angles(prm.rSh or 0,0,0))
+	rotateSubtree(s, RIG.subtree.LeftUpperArm,  jointPivot(s,"LeftUpperArm"),  CFrame.Angles(prm.lSh or 0,0,0))
+	rotateSubtree(s, RIG.subtree.RightLowerArm, jointPivot(s,"RightLowerArm"), CFrame.Angles(prm.rEl or 0,0,0))
+	rotateSubtree(s, RIG.subtree.LeftLowerArm,  jointPivot(s,"LeftLowerArm"),  CFrame.Angles(prm.lEl or 0,0,0))
+	rotateSubtree(s, RIG.subtree.RightUpperLeg, jointPivot(s,"RightUpperLeg"), CFrame.Angles(prm.rHip or 0,0,0))
+	rotateSubtree(s, RIG.subtree.LeftUpperLeg,  jointPivot(s,"LeftUpperLeg"),  CFrame.Angles(prm.lHip or 0,0,0))
+	rotateSubtree(s, RIG.subtree.RightLowerLeg, jointPivot(s,"RightLowerLeg"), CFrame.Angles(prm.rKnee or 0,0,0))
+	rotateSubtree(s, RIG.subtree.LeftLowerLeg,  jointPivot(s,"LeftLowerLeg"),  CFrame.Angles(prm.lKnee or 0,0,0))
+	local bx, by, bz = prm.bodyX or 0, prm.bodyY or 0, prm.bodyZ or 0
+	if bx ~= 0 or by ~= 0 or bz ~= 0 then translateAll(s, Vector3.new(bx, by, bz)) end
+	return s
+end
+local PKEYS = {"bodyX","bodyY","bodyZ","lean","rHip","lHip","rKnee","lKnee","rSh","lSh","rEl","lEl"}
+local function lerpParams(a, b, t)
+	local r = {}
+	for _, k in ipairs(PKEYS) do
+		local av, bv = a[k] or 0, b[k] or 0
+		r[k] = av + (bv - av) * t
+	end
+	return r
+end
+
+-------------------------------------------------------------------
+-- ANIMATION LIBRARY  (each returns a list of posed snapshots)
+-------------------------------------------------------------------
+local Anims = {}
+
+function Anims.wave(n)
+	local out = {}
+	for i = 1, n do
+		local t = (n > 1) and (i-1)/(n-1) or 0
+		local s = snapshot()
+		rotateSubtree(s, RIG.subtree.RightUpperArm, jointPivot(s,"RightUpperArm"), CFrame.Angles(0,0,-rad(115)))
+		rotateSubtree(s, RIG.subtree.RightLowerArm, jointPivot(s,"RightLowerArm"),
+			CFrame.Angles(0, math.sin(t*math.pi*3)*rad(38), 0))
+		out[i] = s
+	end
+	return out
+end
+
+-- ADVANCED WALK: hip swing, swing-phase knee tuck, arm counter-swing,
+-- contact dips (2 per stride), forward lean, side-to-side weight shift
+function Anims.walk(n)
+	local out, A, armA = {}, rad(42), rad(30)
+	for i = 1, n do
+		local ph = (i-1)/n * math.pi*2
+		local s, c = math.sin(ph), math.cos(ph)
+		out[i] = applyParams{
+			rHip  = s*A, lHip = -s*A,
+			rKnee = math.max(0,-s)*rad(58) + (0.5-0.5*c)*rad(6),
+			lKnee = math.max(0, s)*rad(58) + (0.5+0.5*c)*rad(6),
+			rSh   = -s*armA, lSh = s*armA,
+			rEl   = rad(14), lEl = rad(14),
+			lean  = rad(7),
+			bodyY = math.abs(math.sin(ph*2))*0.14,
+			bodyX = c*0.14,
+		}
+	end
+	return out
+end
+
+-- IDLE BREATHING: subtle bob + arm sway (great human "filler")
+function Anims.idle(n)
+	local out = {}
+	for i = 1, n do
+		local ph = (i-1)/n * math.pi*2
+		local b = math.sin(ph)
+		out[i] = applyParams{ bodyY=b*0.06, lean=rad(2)+b*rad(1.5),
+			rSh=b*rad(3), lSh=-b*rad(3), rEl=rad(7), lEl=rad(7) }
+	end
+	return out
+end
+
+-- RUN + JUMP: run cycle -> crouch -> launch -> apex tuck -> fall -> land
+function Anims.runjump(n)
+	local out   = {}
+	local runN  = math.floor(n * 0.58)
+	local jumpN = n - runN
+	local A     = rad(48)
+	for i = 1, runN do
+		local p  = (i-1)/runN * math.pi*2*2.5
+		local sp = math.sin(p)
+		out[i] = applyParams{
+			rHip=sp*A, lHip=-sp*A,
+			rKnee=math.max(0,-sp)*rad(80), lKnee=math.max(0,sp)*rad(80),
+			rSh=-sp*rad(42), lSh=sp*rad(42), rEl=rad(78), lEl=rad(78),
+			lean=rad(22), bodyY=math.abs(sp)*0.35,
+		}
+	end
+	local stand   = { lean=rad(22), rEl=rad(30), lEl=rad(30) }
+	local crouch  = { bodyY=-0.9, lean=rad(34), rHip=rad(42), lHip=rad(42), rKnee=rad(85), lKnee=rad(85), rSh=-rad(55), lSh=-rad(55), rEl=rad(20), lEl=rad(20) }
+	local launch  = { bodyY=0.4, lean=rad(8), rHip=-rad(18), lHip=-rad(18), rKnee=rad(5), lKnee=rad(5), rSh=rad(165), lSh=rad(165) }
+	local apex    = { bodyY=6.0, rHip=rad(38), lHip=rad(38), rKnee=rad(70), lKnee=rad(70), rSh=rad(120), lSh=rad(120), rEl=rad(20), lEl=rad(20) }
+	local fall    = { bodyY=2.2, lean=rad(6), rHip=rad(12), lHip=rad(12), rKnee=rad(25), lKnee=rad(25), rSh=rad(70), lSh=rad(70), rEl=rad(15), lEl=rad(15) }
+	local land    = { bodyY=-1.0, lean=rad(38), rHip=rad(48), lHip=rad(48), rKnee=rad(92), lKnee=rad(92), rSh=-rad(30), lSh=-rad(30), rEl=rad(28), lEl=rad(28) }
+	local recover = { lean=rad(10), rEl=rad(12), lEl=rad(12) }
+	local seg = { {stand,crouch,0.18},{crouch,launch,0.12},{launch,apex,0.20},
+	              {apex,fall,0.18},{fall,land,0.20},{land,recover,0.12} }
+	for _, S in ipairs(seg) do
+		local fcount = math.max(1, math.floor(jumpN * S[3]))
+		for k = 1, fcount do out[#out+1] = applyParams(lerpParams(S[1], S[2], k/fcount)) end
+	end
+	return out
+end
+
+-------------------------------------------------------------------
+-- PRESETS
+-------------------------------------------------------------------
+local PRESETS = {
+	{ id="walk",    label="Advanced Walk", gen=Anims.walk,    frames=32, desc="Full walk cycle, weight shift + knee tuck" },
+	{ id="runjump", label="Run + Jump",    gen=Anims.runjump, frames=48, desc="Run into a full crouch-launch-land jump" },
+	{ id="wave",    label="Friendly Wave", gen=Anims.wave,    frames=16, desc="Arm raise + oscillating hand wave" },
+	{ id="idle",    label="Idle Breathing",gen=Anims.idle,    frames=24, desc="Subtle bob + sway, human filler" },
+}
+
+-------------------------------------------------------------------
+-- BUILDER  (async, human-paced, cancellable)
+-------------------------------------------------------------------
+local rng = Random.new()
+local State = { building=false, cancel=false }
+
+local function fmtTime(sec)
+	sec = math.max(0, math.floor(sec + 0.5))
+	return string.format("%d:%02d", math.floor(sec/60), sec % 60)
+end
+local function etaSeconds(frameCount, speed)
+	return math.max(0, frameCount-1) * ((speed.min + speed.max) / 2) + 0.4
+end
+
+-- cb(stage, i, total, remainSec)
+local function buildMovie(preset, name, frameCount, speed, publish, cb)
+	State.building, State.cancel = true, false
+	refreshFromLive()
+
+	cb("Creating movie…", 0, frameCount, etaSeconds(frameCount, speed))
+	invoke("RequestNewMovie"); task.wait(0.35)
+	invoke("SetMetadata", { title = name, description = "Built with MM4 Auto Animator" })
+	invoke("SetSettings", CFG.settings)
+
+	local snaps = preset.gen(frameCount)
+	local poses = {}
+	for i, s in ipairs(snaps) do poses[i] = buildPoseTable(s) end
+	local total = #poses
+
+	invoke("OverwriteFrame", 1, poses[1])
+	cb("Posing…", 1, total, etaSeconds(total, speed))
+	for i = 2, total do
+		if State.cancel then break end
+		invoke("InsertAfter", i-1, poses[i])
+		local remain = (total - i) * ((speed.min + speed.max)/2)
+		cb("Posing…", i, total, remain)
+		task.wait(rng:NextNumber(speed.min, speed.max))
+	end
+
+	if not State.cancel then
+		invoke("SaveMovie")
+		if publish then invoke("PublishMovie") end
+		cb(publish and "Published!" or "Saved!", total, total, 0)
+	else
+		cb("Cancelled", 0, total, 0)
+	end
+	State.building = false
+	return not State.cancel
+end
+
+-------------------------------------------------------------------
+-- GUI
+-------------------------------------------------------------------
+local C = {
+	bg     = Color3.fromRGB(22,22,27),   panel = Color3.fromRGB(31,31,38),
+	panel2 = Color3.fromRGB(41,41,50),   text  = Color3.fromRGB(236,236,241),
+	sub    = Color3.fromRGB(150,150,162), accent= Color3.fromRGB(99,102,241),
+	good   = Color3.fromRGB(46,204,113),  bad   = Color3.fromRGB(231,76,60),
+	track  = Color3.fromRGB(50,50,60),
+}
+local function corner(inst, r) local u=Instance.new("UICorner"); u.CornerRadius=UDim.new(0, r or 8); u.Parent=inst end
+local function pad(inst, p) local u=Instance.new("UIPadding")
+	u.PaddingLeft=UDim.new(0,p); u.PaddingRight=UDim.new(0,p); u.PaddingTop=UDim.new(0,p); u.PaddingBottom=UDim.new(0,p); u.Parent=inst end
+local function mk(class, props, parent)
+	local o=Instance.new(class); for k,v in pairs(props) do o[k]=v end; o.Parent=parent; return o
+end
+
+-- destroy prior instance
+local guiParent = (gethui and gethui()) or (game:FindService("CoreGui")) or Players.LocalPlayer:WaitForChild("PlayerGui")
+local old = guiParent:FindFirstChild("MM4AutoAnimator"); if old then old:Destroy() end
+
+local sg = mk("ScreenGui", { Name="MM4AutoAnimator", ResetOnSpawn=false,
+	ZIndexBehavior=Enum.ZIndexBehavior.Sibling, IgnoreGuiInset=true }, guiParent)
+
+local main = mk("Frame", { Size=UDim2.new(0,340,0,470),
+	Position=UDim2.new(0.5,-170,0.5,-235), BackgroundColor3=C.bg,
+	BorderSizePixel=0, Active=true }, sg)
+corner(main,12)
+mk("UIStroke", { Color=C.panel2, Thickness=1 }, main)
+
+-- title bar
+local bar = mk("Frame", { Size=UDim2.new(1,0,0,42), BackgroundColor3=C.panel, BorderSizePixel=0 }, main)
+corner(bar,12)
+mk("Frame",{Size=UDim2.new(1,0,0,12),Position=UDim2.new(0,0,1,-12),BackgroundColor3=C.panel,BorderSizePixel=0},bar)
+mk("TextLabel", { Size=UDim2.new(1,-90,1,0), Position=UDim2.new(0,14,0,0), BackgroundTransparency=1,
+	Font=Enum.Font.GothamBold, Text="🎬  MM4 Auto Animator", TextColor3=C.text, TextSize=15,
+	TextXAlignment=Enum.TextXAlignment.Left }, bar)
+local closeBtn = mk("TextButton", { Size=UDim2.new(0,30,0,30), Position=UDim2.new(1,-38,0,6),
+	BackgroundColor3=C.panel2, Text="✕", TextColor3=C.text, Font=Enum.Font.GothamBold, TextSize=14,
+	AutoButtonColor=true }, bar); corner(closeBtn,8)
+
+-- body scroller
+local body = mk("Frame", { Size=UDim2.new(1,0,1,-42), Position=UDim2.new(0,0,0,42),
+	BackgroundTransparency=1 }, main)
+pad(body,14)
+local list = mk("Frame",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1},body)
+local layout = mk("UIListLayout",{Padding=UDim.new(0,9),SortOrder=Enum.SortOrder.LayoutOrder},list)
+
+local function sectionLabel(txt, order)
+	return mk("TextLabel", { Size=UDim2.new(1,0,0,16), BackgroundTransparency=1, LayoutOrder=order,
+		Font=Enum.Font.GothamMedium, Text=txt, TextColor3=C.sub, TextSize=12,
+		TextXAlignment=Enum.TextXAlignment.Left }, list)
+end
+
+-- project name
+sectionLabel("PROJECT NAME", 1)
+local nameBox = mk("TextBox", { Size=UDim2.new(1,0,0,38), BackgroundColor3=C.panel, BorderSizePixel=0,
+	LayoutOrder=2, Font=Enum.Font.Gotham, PlaceholderText="Type a project name…",
+	Text="", TextColor3=C.text, PlaceholderColor3=C.sub, TextSize=14, ClearTextOnFocus=false,
+	TextXAlignment=Enum.TextXAlignment.Left }, list)
+corner(nameBox,8); pad(nameBox,10)
+
+-- preset picker
+sectionLabel("PRESET", 3)
+local presetHolder = mk("Frame",{Size=UDim2.new(1,0,0,0),BackgroundTransparency=1,LayoutOrder=4,
+	AutomaticSize=Enum.AutomaticSize.Y},list)
+local pLayout = mk("UIListLayout",{Padding=UDim.new(0,6),SortOrder=Enum.SortOrder.LayoutOrder},presetHolder)
+
+local selected = PRESETS[1]
+local presetButtons = {}
+local framesBox, etaLabel  -- forward decl
+
+local function refreshETA()
+	local fc = tonumber(framesBox.Text) or selected.frames
+	etaLabel.Text = "⏱  Estimated build time:  " .. fmtTime(etaSeconds(fc, State.speed or SPEEDS[2]))
+end
+
+for i, preset in ipairs(PRESETS) do
+	local btn = mk("TextButton", { Size=UDim2.new(1,0,0,44), BackgroundColor3=C.panel, BorderSizePixel=0,
+		LayoutOrder=i, Text="", AutoButtonColor=true }, presetHolder)
+	corner(btn,8)
+	local stroke = mk("UIStroke",{Color=C.accent,Thickness=0,Transparency=0},btn)
+	mk("TextLabel",{Size=UDim2.new(1,-16,0,20),Position=UDim2.new(0,12,0,5),BackgroundTransparency=1,
+		Font=Enum.Font.GothamBold,Text=preset.label,TextColor3=C.text,TextSize=14,
+		TextXAlignment=Enum.TextXAlignment.Left},btn)
+	mk("TextLabel",{Size=UDim2.new(1,-16,0,16),Position=UDim2.new(0,12,0,23),BackgroundTransparency=1,
+		Font=Enum.Font.Gotham,Text=preset.desc,TextColor3=C.sub,TextSize=11,
+		TextXAlignment=Enum.TextXAlignment.Left},btn)
+	presetButtons[i] = { btn=btn, stroke=stroke, preset=preset }
+	btn.MouseButton1Click:Connect(function()
+		selected = preset
+		for _, pb in ipairs(presetButtons) do
+			pb.stroke.Thickness = (pb.preset == preset) and 2 or 0
+			pb.btn.BackgroundColor3 = (pb.preset == preset) and C.panel2 or C.panel
+		end
+		framesBox.Text = tostring(preset.frames)
+		refreshETA()
+	end)
+end
+
+-- frames + speed row
+sectionLabel("FRAMES  &  REALISM", 5)
+local row = mk("Frame",{Size=UDim2.new(1,0,0,38),BackgroundTransparency=1,LayoutOrder=6},list)
+framesBox = mk("TextBox",{Size=UDim2.new(0,72,1,0),BackgroundColor3=C.panel,BorderSizePixel=0,
+	Font=Enum.Font.GothamBold,Text=tostring(selected.frames),TextColor3=C.text,TextSize=15,
+	ClearTextOnFocus=false},row); corner(framesBox,8)
+local speedHolder = mk("Frame",{Size=UDim2.new(1,-80,1,0),Position=UDim2.new(0,80,0,0),
+	BackgroundTransparency=1},row)
+local sLayout=mk("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,6),
+	HorizontalAlignment=Enum.HorizontalAlignment.Right},speedHolder)
+State.speed = SPEEDS[2]
+local speedButtons={}
+for i,sp in ipairs(SPEEDS) do
+	local b=mk("TextButton",{Size=UDim2.new(0,80,1,0),BackgroundColor3=C.panel,BorderSizePixel=0,
+		Font=Enum.Font.GothamMedium,Text=sp.label,TextColor3=C.text,TextSize=12,LayoutOrder=i},speedHolder)
+	corner(b,8)
+	local st=mk("UIStroke",{Color=C.accent,Thickness=(sp==State.speed) and 2 or 0},b)
+	speedButtons[i]={b=b,st=st,sp=sp}
+	b.MouseButton1Click:Connect(function()
+		State.speed=sp
+		for _,sb in ipairs(speedButtons) do
+			sb.st.Thickness=(sb.sp==sp) and 2 or 0
+			sb.b.BackgroundColor3=(sb.sp==sp) and C.panel2 or C.panel
+		end
+		refreshETA()
+	end)
+end
+
+-- publish toggle
+local pubRow = mk("Frame",{Size=UDim2.new(1,0,0,26),BackgroundTransparency=1,LayoutOrder=7},list)
+local pubState={on=false}
+local pubBox=mk("TextButton",{Size=UDim2.new(0,24,0,24),BackgroundColor3=C.panel,BorderSizePixel=0,
+	Text="",AutoButtonColor=true},pubRow); corner(pubBox,6)
+local pubCheck=mk("TextLabel",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Text="",
+	Font=Enum.Font.GothamBold,TextColor3=C.good,TextSize=16},pubBox)
+mk("TextLabel",{Size=UDim2.new(1,-32,1,0),Position=UDim2.new(0,32,0,0),BackgroundTransparency=1,
+	Font=Enum.Font.Gotham,Text="Publish when finished (otherwise save as draft)",
+	TextColor3=C.sub,TextSize=12,TextXAlignment=Enum.TextXAlignment.Left},pubRow)
+pubBox.MouseButton1Click:Connect(function()
+	pubState.on=not pubState.on; pubCheck.Text=pubState.on and "✓" or ""
+	pubBox.BackgroundColor3=pubState.on and C.panel2 or C.panel
+end)
+
+-- ETA label
+etaLabel = mk("TextLabel",{Size=UDim2.new(1,0,0,18),BackgroundTransparency=1,LayoutOrder=8,
+	Font=Enum.Font.GothamMedium,Text="",TextColor3=C.text,TextSize=13,
+	TextXAlignment=Enum.TextXAlignment.Left},list)
+
+-- progress bar + status
+local progBG=mk("Frame",{Size=UDim2.new(1,0,0,10),BackgroundColor3=C.track,BorderSizePixel=0,
+	LayoutOrder=9},list); corner(progBG,6)
+local progFill=mk("Frame",{Size=UDim2.new(0,0,1,0),BackgroundColor3=C.accent,BorderSizePixel=0},progBG)
+corner(progFill,6)
+local statusLbl=mk("TextLabel",{Size=UDim2.new(1,0,0,16),BackgroundTransparency=1,LayoutOrder=10,
+	Font=Enum.Font.Gotham,Text="Idle",TextColor3=C.sub,TextSize=12,
+	TextXAlignment=Enum.TextXAlignment.Left},list)
+
+-- build + cancel
+local btnRow=mk("Frame",{Size=UDim2.new(1,0,0,42),BackgroundTransparency=1,LayoutOrder=11},list)
+local buildBtn=mk("TextButton",{Size=UDim2.new(1,-96,1,0),BackgroundColor3=C.good,BorderSizePixel=0,
+	Font=Enum.Font.GothamBold,Text="▶  BUILD",TextColor3=Color3.new(1,1,1),TextSize=15,
+	AutoButtonColor=true},btnRow); corner(buildBtn,8)
+local cancelBtn=mk("TextButton",{Size=UDim2.new(0,88,1,0),Position=UDim2.new(1,-88,0,0),
+	BackgroundColor3=C.bad,BorderSizePixel=0,Font=Enum.Font.GothamBold,Text="STOP",
+	TextColor3=Color3.new(1,1,1),TextSize=14,AutoButtonColor=true,Visible=false},btnRow); corner(cancelBtn,8)
+
+-- init selection visuals
+presetButtons[1].stroke.Thickness=2; presetButtons[1].btn.BackgroundColor3=C.panel2
+refreshETA()
+framesBox:GetPropertyChangedSignal("Text"):Connect(refreshETA)
+
+-- progress callback
+local function onProgress(stage, i, total, remain)
+	local a = (total>0) and (i/total) or 0
+	progFill:TweenSize(UDim2.new(a,0,1,0), Enum.EasingDirection.Out, Enum.EasingStyle.Quad, 0.15, true)
+	if i>0 and total>0 then
+		statusLbl.Text = string.format("%s  frame %d / %d", stage, i, total)
+	else
+		statusLbl.Text = stage
+	end
+	if remain and remain>0 then
+		etaLabel.Text = "⏱  Time remaining:  " .. fmtTime(remain)
+	elseif stage=="Saved!" or stage=="Published!" then
+		etaLabel.Text = "✅  " .. stage
+	end
+end
+
+buildBtn.MouseButton1Click:Connect(function()
+	if State.building then return end
+	local name = nameBox.Text:gsub("^%s+",""):gsub("%s+$","")
+	if name == "" then
+		statusLbl.Text = "⚠ Enter a project name first"; statusLbl.TextColor3=C.bad
+		nameBox:CaptureFocus(); return
+	end
+	statusLbl.TextColor3 = C.sub
+	local fc = math.clamp(math.floor(tonumber(framesBox.Text) or selected.frames), 2, 400)
+	framesBox.Text = tostring(fc)
+	buildBtn.Visible=false; cancelBtn.Visible=true; buildBtn.Text="Building…"
+	task.spawn(function()
+		buildMovie(selected, name, fc, State.speed, pubState.on, onProgress)
+		buildBtn.Visible=true; cancelBtn.Visible=false; buildBtn.Text="▶  BUILD"
+	end)
+end)
+cancelBtn.MouseButton1Click:Connect(function() State.cancel=true; statusLbl.Text="Stopping…" end)
+closeBtn.MouseButton1Click:Connect(function() State.cancel=true; sg:Destroy() end)
+
+-- dragging (mouse + touch)
+do
+	local dragging, dragStart, startPos
+	local function begin(inp)
+		if inp.UserInputType==Enum.UserInputType.MouseButton1 or inp.UserInputType==Enum.UserInputType.Touch then
+			dragging=true; dragStart=inp.Position; startPos=main.Position
+		end
+	end
+	bar.InputBegan:Connect(begin)
+	UIS.InputChanged:Connect(function(inp)
+		if dragging and (inp.UserInputType==Enum.UserInputType.MouseMovement or inp.UserInputType==Enum.UserInputType.Touch) then
+			local d=inp.Position-dragStart
+			main.Position=UDim2.new(startPos.X.Scale, startPos.X.Offset+d.X, startPos.Y.Scale, startPos.Y.Offset+d.Y)
+		end
+	end)
+	UIS.InputEnded:Connect(function(inp)
+		if inp.UserInputType==Enum.UserInputType.MouseButton1 or inp.UserInputType==Enum.UserInputType.Touch then dragging=false end
+	end)
+end
+
+print("[MM4] Auto Animator v3 loaded — remotes found:",
+	RF.RequestNewMovie~=nil, RF.InsertAfter~=nil, RF.SetMetadata~=nil)
