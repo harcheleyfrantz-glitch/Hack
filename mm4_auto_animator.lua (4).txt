@@ -1,0 +1,1522 @@
+--[[==================================================================
+    MM4 AUTO ANIMATOR — v3  (standalone GUI tool, single R15 character)
+    ------------------------------------------------------------------
+    HOW TO USE:
+      1. Join Movie Maker 4. Stay on the title screen — DO NOT open the editor.
+      2. Execute this script in Delta.
+      3. A window appears. Type a PROJECT NAME, pick a preset, hit BUILD.
+      4. The tool creates a fresh movie, ensures a rig exists, and lays down
+         real frames one at a time (human-paced) so it looks hand-made.
+         Progress + ETA are shown live.
+      5. NAMING: leave Auto-save OFF and name it yourself via the game's Save
+         popup (default). Turn Auto-save ON to name+save with the typed name.
+
+    WHY IT WORKS WITHOUT THE EDITOR:
+      Frames are just pose tables (world-space CFrames per part) pushed through
+      ReplicatedStorage.MovieNet. We embed a real neutral R15 pose captured from
+      your dump, so we don't need the live rig in Workspace to author frames.
+      If the live rig IS present, we refresh colors/sizes/pose from it.
+
+    PROTOCOL (from your captures):
+      MovieNet.RequestNewMovie()            -> blank movie (frame 1 exists)
+      MovieNet.SetMetadata({title=...})     -> names the project
+      MovieNet.SetSettings({fps,scenery..}) -> movie settings
+      MovieNet.OverwriteFrame(i, pose)      -> replace frame i
+      MovieNet.InsertAfter(i, pose)         -> insert after i, returns {total,interval..}
+      MovieNet.SaveMovie() / PublishMovie() -> persist / publish
+==================================================================]]
+
+-------------------------------------------------------------------
+-- EMBEDDED NEUTRAL BASE POSE  (R15 Noob, right arm normalized)
+-------------------------------------------------------------------
+local BASE_POSE = {
+	["R15 Noob.LowerTorso"] = { cf={-0.0, 12.702983, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={2.0, 0.400101, 1.0} },
+	["R15 Noob.UpperTorso"] = { cf={-0.0, 13.702996, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.129412, 0.329412, 0.72549}, size={2.0, 1.6, 1.0} },
+	["R15 Noob.UpperTorso.PivotPart"] = { cf={-1e-05, 12.902966, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.Head"] = { cf={-0.0, 15.003016, 0.000273, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.960784, 0.803922, 0.188235}, size={1.19784, 1.2024, 1.197901} },
+	["R15 Noob.Head.PivotPart"] = { cf={-0.000368, 14.499536, 2e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftUpperArm"] = { cf={-1.500003, 13.871687, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.960784, 0.803922, 0.188235}, size={1.0, 1.168699, 1.0} },
+	["R15 Noob.LeftUpperArm.PivotPart"] = { cf={-0.999992, 14.099492, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftLowerArm"] = { cf={-1.500003, 13.278944, 4e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 1.051899, 1.0} },
+	["R15 Noob.LeftLowerArm.PivotPart"] = { cf={-1.5, 13.537314, -4e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftHand"] = { cf={-1.500003, 12.652966, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 0.3001, 1.0} },
+	["R15 Noob.LeftHand.PivotPart"] = { cf={-1.5, 12.782969, -4e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightUpperArm"] = { cf={1.500003, 13.871687, -0.0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.960784, 0.803922, 0.188235}, size={1.0, 1.168699, 1.0} },
+	["R15 Noob.RightUpperArm.PivotPart"] = { cf={0.999992, 14.099492, -0.0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightLowerArm"] = { cf={1.500003, 13.278944, 4e-06, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.498039, 0.498039, 0.498039}, size={1.0, 1.051899, 1.0} },
+	["R15 Noob.RightLowerArm.PivotPart"] = { cf={1.5, 13.537314, -4e-06, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightHand"] = { cf={1.500003, 12.652966, -0.0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.498039, 0.498039, 0.498039}, size={1.0, 0.3001, 1.0} },
+	["R15 Noob.RightHand.PivotPart"] = { cf={1.5, 12.782969, -4e-06, 1, 0, 0, 0, 1, 0, 0, 0, 1}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftUpperLeg"] = { cf={-0.500001, 12.082227, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.294118, 0.592157, 0.294118}, size={1.0, 1.2166, 0.999899} },
+	["R15 Noob.LeftUpperLeg.PivotPart"] = { cf={-0.500011, 12.50311, -4e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftLowerLeg"] = { cf={-0.500001, 11.302105, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 1.1931, 1.0} },
+	["R15 Noob.LeftLowerLeg.PivotPart"] = { cf={-0.500027, 11.67413, -8e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.LeftFoot"] = { cf={-0.500001, 10.649539, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 0.299999, 1.0} },
+	["R15 Noob.LeftFoot.PivotPart"] = { cf={-0.500009, 10.799531, 0.000561, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightUpperLeg"] = { cf={0.500001, 12.082227, 4.8e-05, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.294118, 0.592157, 0.294118}, size={1.0, 1.2166, 0.999899} },
+	["R15 Noob.RightUpperLeg.PivotPart"] = { cf={0.499986, 12.502887, -2e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightLowerLeg"] = { cf={0.500001, 11.302105, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 1.1931, 1.0} },
+	["R15 Noob.RightLowerLeg.PivotPart"] = { cf={0.499986, 11.673919, -4e-06, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["R15 Noob.RightFoot"] = { cf={0.500001, 10.653007, -0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.498039, 0.498039, 0.498039}, size={1.0, 0.299999, 1.0} },
+	["R15 Noob.RightFoot.PivotPart"] = { cf={0.499986, 10.799537, 0.000553, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0}, color={0.0, 1.0, 0.0}, size={0.4, 0.4, 0.4} },
+	["Camera.CameraPart"] = { cf={-0.206215, 15.695602, -18.375015, -1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0}, color={0.639216, 0.635294, 0.647059}, size={3.489182, 2.364506, 3.017387} },
+}
+
+-------------------------------------------------------------------
+-- CONFIG
+-------------------------------------------------------------------
+local CFG = {
+	modelName = "R15 Noob",
+	settings  = { skybox="Default", timeOfDay="14:30:00", cameraFOV="40",
+	              scenery="Default", tweening=true, cameraTweening=true, fps=25 },
+}
+local SPEEDS = {   -- per-frame authoring delay (seconds) -> the "human" pacing
+	{ id="fast",       label="Fast",       min=0.05, max=0.12 },
+	{ id="human",      label="Human",      min=0.9,  max=1.9  },
+	{ id="meticulous", label="Meticulous", min=2.0,  max=3.6  },
+}
+
+-------------------------------------------------------------------
+-- SERVICES / REMOTES
+-------------------------------------------------------------------
+local RS      = game:GetService("ReplicatedStorage")
+local UIS     = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+
+local MovieNet = RS:WaitForChild("MovieNet", 10)
+local RF = {}
+for _, name in ipairs({"RequestNewMovie","OverwriteFrame","InsertAfter","SetSettings",
+                       "SetMetadata","AddEffect","SaveMovie","PublishMovie"}) do
+	RF[name] = MovieNet and MovieNet:FindFirstChild(name)
+end
+local function invoke(name, ...)
+	local rf = RF[name]
+	if not rf then warn("[MM4] missing remote: "..name); return false end
+	local a = {...}
+	local ok, res = pcall(function() return rf:InvokeServer(table.unpack(a)) end)
+	if not ok then warn("[MM4] "..name.." failed: "..tostring(res)) end
+	return ok, res
+end
+
+-------------------------------------------------------------------
+-- POSE MODEL  (short-keyed CFrame snapshots + metadata)
+-------------------------------------------------------------------
+local PREFIX = CFG.modelName .. "."
+local BASECF, BASEMETA = {}, {}          -- short -> CFrame ; short -> {color,size}
+local function cfFromArr(a) return CFrame.new(table.unpack(a)) end
+local function shortKey(full)
+	if full == "Camera.CameraPart" then return "__CameraPart" end
+	if full:sub(1, #PREFIX) == PREFIX then return full:sub(#PREFIX + 1) end
+	return full
+end
+local function fullKey(short)
+	if short == "__CameraPart" then return "Camera.CameraPart" end
+	return PREFIX .. short
+end
+for full, v in pairs(BASE_POSE) do
+	local s = shortKey(full)
+	BASECF[s]   = cfFromArr(v.cf)
+	BASEMETA[s] = { color = v.color, size = v.size }
+end
+
+-- the set of valid short keys (from the embedded pose) — used to reject stray parts
+local KNOWN = {}
+for k in pairs(BASECF) do KNOWN[k] = true end
+
+-- ── live rig detection / insertion ─────────────────────────────
+local RemoteEvents = RS:FindFirstChild("RemoteEvents")
+local InsertModel  = RemoteEvents and RemoteEvents:FindFirstChild("InsertRelated")
+                     and RemoteEvents.InsertRelated:FindFirstChild("InsertModel")
+
+-- any model in a jobfolder that has an UpperTorso is the movie rig
+local function findRig()
+	for _, folder in ipairs(workspace:GetChildren()) do
+		if folder:IsA("Folder") and folder:FindFirstChild("Models") then
+			for _, m in ipairs(folder.Models:GetChildren()) do
+				if m:IsA("Model") and m:FindFirstChild("UpperTorso") then
+					return m, folder
+				end
+			end
+		end
+	end
+end
+
+-- make sure a rig exists in the movie; insert one if not
+local function ensureRig()
+	local m, f = findRig()
+	if m then return m, f end
+	if InsertModel then
+		pcall(function() InsertModel:FireServer(CFG.modelName, CFrame.new(0, 13, 0)) end)
+		local t = 0
+		repeat task.wait(0.25); t = t + 0.25; m, f = findRig() until m or t > 8
+	end
+	return m, f
+end
+
+-- rebuild the base pose (short-keyed) from a live model so part keys, rest
+-- pose, colours and sizes EXACTLY match the movie's actual rig. This is the
+-- fix for empty / T-posed frames: pose keys must equal "<ModelName>.<Part>".
+local function rebuildBaseFrom(model, camModel)
+	if not model then return end
+	PREFIX = model.Name .. "."
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			local rel
+			if part.Name == "PivotPart" and part.Parent and part.Parent:IsA("BasePart") then
+				rel = part.Parent.Name .. ".PivotPart"
+			elseif part.Parent == model then
+				rel = part.Name
+			end
+			if rel and KNOWN[rel] then
+				BASECF[rel]   = part.CFrame
+				BASEMETA[rel] = { color = {part.Color.R, part.Color.G, part.Color.B},
+				                  size  = {part.Size.X, part.Size.Y, part.Size.Z} }
+			end
+		end
+	end
+	if camModel then
+		local cp = camModel:FindFirstChild("CameraPart")
+		if cp then
+			BASECF["__CameraPart"]   = cp.CFrame
+			BASEMETA["__CameraPart"] = { color = {cp.Color.R, cp.Color.G, cp.Color.B},
+			                             size  = {cp.Size.X, cp.Size.Y, cp.Size.Z} }
+		end
+	end
+end
+
+local function snapshot()          -- fresh working copy of base CFrames
+	local s = {}
+	for k, cf in pairs(BASECF) do s[k] = cf end
+	return s
+end
+
+local function buildPoseTable(snap)
+	local pose = {}
+	for short, cf in pairs(snap) do
+		local meta = BASEMETA[short]
+		pose[fullKey(short)] = { cf = { cf:GetComponents() }, color = meta.color, size = meta.size }
+	end
+	return pose
+end
+
+-------------------------------------------------------------------
+-- FK HELPERS
+-------------------------------------------------------------------
+local RIG = {
+	subtree = {
+		UpperBody     = {"UpperTorso","Head","LeftUpperArm","LeftLowerArm","LeftHand",
+		                 "RightUpperArm","RightLowerArm","RightHand"},
+		RightUpperArm = {"RightUpperArm","RightLowerArm","RightHand"},
+		LeftUpperArm  = {"LeftUpperArm","LeftLowerArm","LeftHand"},
+		RightLowerArm = {"RightLowerArm","RightHand"},
+		LeftLowerArm  = {"LeftLowerArm","LeftHand"},
+		RightUpperLeg = {"RightUpperLeg","RightLowerLeg","RightFoot"},
+		LeftUpperLeg  = {"LeftUpperLeg","LeftLowerLeg","LeftFoot"},
+		RightLowerLeg = {"RightLowerLeg","RightFoot"},
+		LeftLowerLeg  = {"LeftLowerLeg","LeftFoot"},
+	},
+}
+local function jointPivot(snap, owner)
+	local pk = owner .. ".PivotPart"
+	if snap[pk] then return snap[pk].Position end
+	if snap[owner] then return snap[owner].Position end
+	return Vector3.new()
+end
+local function rotateSubtree(snap, parts, pivot, rot)
+	if not rot then return end
+	local T = CFrame.new(pivot) * rot * CFrame.new(pivot):Inverse()
+	for _, n in ipairs(parts) do
+		if snap[n] then snap[n] = T * snap[n] end
+		local pk = n .. ".PivotPart"
+		if snap[pk] then snap[pk] = T * snap[pk] end
+	end
+end
+local function translateAll(snap, v)
+	for k, cf in pairs(snap) do
+		if k ~= "__CameraPart" then snap[k] = cf + v end
+	end
+end
+local rad = math.rad
+-- order: lean -> shoulders -> elbows -> hips -> knees -> body translate
+local function applyParams(prm)
+	local s = snapshot()
+	if prm.lean and prm.lean ~= 0 then
+		rotateSubtree(s, RIG.subtree.UpperBody, jointPivot(s,"UpperTorso"), CFrame.Angles(prm.lean,0,0))
+	end
+	rotateSubtree(s, RIG.subtree.RightUpperArm, jointPivot(s,"RightUpperArm"), CFrame.Angles(prm.rSh or 0,0,0))
+	rotateSubtree(s, RIG.subtree.LeftUpperArm,  jointPivot(s,"LeftUpperArm"),  CFrame.Angles(prm.lSh or 0,0,0))
+	rotateSubtree(s, RIG.subtree.RightLowerArm, jointPivot(s,"RightLowerArm"), CFrame.Angles(prm.rEl or 0,0,0))
+	rotateSubtree(s, RIG.subtree.LeftLowerArm,  jointPivot(s,"LeftLowerArm"),  CFrame.Angles(prm.lEl or 0,0,0))
+	rotateSubtree(s, RIG.subtree.RightUpperLeg, jointPivot(s,"RightUpperLeg"), CFrame.Angles(prm.rHip or 0,0,0))
+	rotateSubtree(s, RIG.subtree.LeftUpperLeg,  jointPivot(s,"LeftUpperLeg"),  CFrame.Angles(prm.lHip or 0,0,0))
+	rotateSubtree(s, RIG.subtree.RightLowerLeg, jointPivot(s,"RightLowerLeg"), CFrame.Angles(prm.rKnee or 0,0,0))
+	rotateSubtree(s, RIG.subtree.LeftLowerLeg,  jointPivot(s,"LeftLowerLeg"),  CFrame.Angles(prm.lKnee or 0,0,0))
+	local bx, by, bz = prm.bodyX or 0, prm.bodyY or 0, prm.bodyZ or 0
+	if bx ~= 0 or by ~= 0 or bz ~= 0 then translateAll(s, Vector3.new(bx, by, bz)) end
+	return s
+end
+local PKEYS = {"bodyX","bodyY","bodyZ","lean","rHip","lHip","rKnee","lKnee","rSh","lSh","rEl","lEl"}
+local function lerpParams(a, b, t)
+	local r = {}
+	for _, k in ipairs(PKEYS) do
+		local av, bv = a[k] or 0, b[k] or 0
+		r[k] = av + (bv - av) * t
+	end
+	return r
+end
+
+-------------------------------------------------------------------
+-- ANIMATION LIBRARY  (each returns a list of posed snapshots)
+-------------------------------------------------------------------
+local Anims = {}
+
+function Anims.wave(n)
+	local out = {}
+	for i = 1, n do
+		local t = (n > 1) and (i-1)/(n-1) or 0
+		local s = snapshot()
+		rotateSubtree(s, RIG.subtree.RightUpperArm, jointPivot(s,"RightUpperArm"), CFrame.Angles(0,0,-rad(115)))
+		rotateSubtree(s, RIG.subtree.RightLowerArm, jointPivot(s,"RightLowerArm"),
+			CFrame.Angles(0, math.sin(t*math.pi*3)*rad(38), 0))
+		out[i] = s
+	end
+	return out
+end
+
+-- ADVANCED WALK: hip swing, swing-phase knee tuck, arm counter-swing,
+-- contact dips (2 per stride), forward lean, side-to-side weight shift
+function Anims.walk(n)
+	local out, A, armA = {}, rad(42), rad(30)
+	for i = 1, n do
+		local ph = (i-1)/n * math.pi*2
+		local s, c = math.sin(ph), math.cos(ph)
+		out[i] = applyParams{
+			rHip  = s*A, lHip = -s*A,
+			rKnee = math.max(0,-s)*rad(58) + (0.5-0.5*c)*rad(6),
+			lKnee = math.max(0, s)*rad(58) + (0.5+0.5*c)*rad(6),
+			rSh   = -s*armA, lSh = s*armA,
+			rEl   = rad(14), lEl = rad(14),
+			lean  = rad(7),
+			bodyY = math.abs(math.sin(ph*2))*0.14,
+			bodyX = c*0.14,
+		}
+	end
+	return out
+end
+
+-- IDLE BREATHING: subtle bob + arm sway (great human "filler")
+function Anims.idle(n)
+	local out = {}
+	for i = 1, n do
+		local ph = (i-1)/n * math.pi*2
+		local b = math.sin(ph)
+		out[i] = applyParams{ bodyY=b*0.06, lean=rad(2)+b*rad(1.5),
+			rSh=b*rad(3), lSh=-b*rad(3), rEl=rad(7), lEl=rad(7) }
+	end
+	return out
+end
+
+-- RUN + JUMP: run cycle -> crouch -> launch -> apex tuck -> fall -> land
+function Anims.runjump(n)
+	local out   = {}
+	local runN  = math.floor(n * 0.58)
+	local jumpN = n - runN
+	local A     = rad(48)
+	for i = 1, runN do
+		local p  = (i-1)/runN * math.pi*2*2.5
+		local sp = math.sin(p)
+		out[i] = applyParams{
+			rHip=sp*A, lHip=-sp*A,
+			rKnee=math.max(0,-sp)*rad(80), lKnee=math.max(0,sp)*rad(80),
+			rSh=-sp*rad(42), lSh=sp*rad(42), rEl=rad(78), lEl=rad(78),
+			lean=rad(22), bodyY=math.abs(sp)*0.35,
+		}
+	end
+	local stand   = { lean=rad(22), rEl=rad(30), lEl=rad(30) }
+	local crouch  = { bodyY=-0.9, lean=rad(34), rHip=rad(42), lHip=rad(42), rKnee=rad(85), lKnee=rad(85), rSh=-rad(55), lSh=-rad(55), rEl=rad(20), lEl=rad(20) }
+	local launch  = { bodyY=0.4, lean=rad(8), rHip=-rad(18), lHip=-rad(18), rKnee=rad(5), lKnee=rad(5), rSh=rad(165), lSh=rad(165) }
+	local apex    = { bodyY=6.0, rHip=rad(38), lHip=rad(38), rKnee=rad(70), lKnee=rad(70), rSh=rad(120), lSh=rad(120), rEl=rad(20), lEl=rad(20) }
+	local fall    = { bodyY=2.2, lean=rad(6), rHip=rad(12), lHip=rad(12), rKnee=rad(25), lKnee=rad(25), rSh=rad(70), lSh=rad(70), rEl=rad(15), lEl=rad(15) }
+	local land    = { bodyY=-1.0, lean=rad(38), rHip=rad(48), lHip=rad(48), rKnee=rad(92), lKnee=rad(92), rSh=-rad(30), lSh=-rad(30), rEl=rad(28), lEl=rad(28) }
+	local recover = { lean=rad(10), rEl=rad(12), lEl=rad(12) }
+	local seg = { {stand,crouch,0.18},{crouch,launch,0.12},{launch,apex,0.20},
+	              {apex,fall,0.18},{fall,land,0.20},{land,recover,0.12} }
+	for _, S in ipairs(seg) do
+		local fcount = math.max(1, math.floor(jumpN * S[3]))
+		for k = 1, fcount do out[#out+1] = applyParams(lerpParams(S[1], S[2], k/fcount)) end
+	end
+	return out
+end
+
+-------------------------------------------------------------------
+-- PRESETS
+-------------------------------------------------------------------
+local PRESETS = {
+	{ id="walk",    label="Advanced Walk", gen=Anims.walk,    frames=32, desc="Full walk cycle, weight shift + knee tuck" },
+	{ id="runjump", label="Run + Jump",    gen=Anims.runjump, frames=48, desc="Run into a full crouch-launch-land jump" },
+	{ id="wave",    label="Friendly Wave", gen=Anims.wave,    frames=16, desc="Arm raise + oscillating hand wave" },
+	{ id="idle",    label="Idle Breathing",gen=Anims.idle,    frames=24, desc="Subtle bob + sway, human filler" },
+}
+
+-------------------------------------------------------------------
+-- BUILDER  (async, human-paced, cancellable)
+-------------------------------------------------------------------
+local rng = Random.new()
+local State = { building=false, cancel=false }
+
+local function fmtTime(sec)
+	sec = math.max(0, math.floor(sec + 0.5))
+	return string.format("%d:%02d", math.floor(sec/60), sec % 60)
+end
+local function etaSeconds(frameCount, speed)
+	return math.max(0, frameCount-1) * ((speed.min + speed.max) / 2) + 0.4
+end
+
+-- cb(stage, i, total, remainSec)
+local function buildMovie(preset, name, frameCount, speed, autosave, cb)
+	if preset.customBuild then return preset.customBuild(name, frameCount, speed, autosave, cb) end
+	State.building, State.cancel = true, false
+
+	cb("Creating movie…", 0, frameCount, etaSeconds(frameCount, speed))
+	invoke("RequestNewMovie"); task.wait(0.5)
+
+	cb("Preparing rig…", 0, frameCount, etaSeconds(frameCount, speed))
+	local rig, jobFolder = ensureRig()
+	if not rig then
+		cb("⚠ No rig — open a blank movie once, then retry", 0, frameCount, 0)
+		State.building = false; return false
+	end
+	local camModel = jobFolder and jobFolder.Models:FindFirstChild("Camera") or nil
+	rebuildBaseFrom(rig, camModel)      -- keys now match the real rig
+
+	invoke("SetSettings", CFG.settings)
+	if autosave and name and name ~= "" then
+		invoke("SetMetadata", { title = name, description = "Built with MM4 Auto Animator" })
+	end
+
+	local snaps = preset.gen(frameCount)
+	local poses = {}
+	for i, s in ipairs(snaps) do poses[i] = buildPoseTable(s) end
+	local total = #poses
+
+	invoke("OverwriteFrame", 1, poses[1])
+	cb("Posing…", 1, total, etaSeconds(total, speed))
+	for i = 2, total do
+		if State.cancel then break end
+		invoke("InsertAfter", i-1, poses[i])
+		local remain = (total - i) * ((speed.min + speed.max)/2)
+		cb("Posing…", i, total, remain)
+		task.wait(rng:NextNumber(speed.min, speed.max))
+	end
+
+	if not State.cancel then
+		if autosave then
+			invoke("SaveMovie")
+			cb('Saved as "'..name..'"', total, total, 0)
+		else
+			cb("Frames built — open movie & Save to name it", total, total, 0)
+		end
+	else
+		cb("Cancelled", 0, total, 0)
+	end
+	State.building = false
+	return not State.cancel
+end
+
+
+-------------------------------------------------------------------
+-- ============ R6 ENGINE  (v4 add-on, original code above kept) ==
+--  Multi-character R6 poser + effects timeline + camera keyframing.
+--  Correct sign convention: forward lean = -X (fixes head-backwards).
+-------------------------------------------------------------------
+local R6 = {}
+local rng6 = Random.new()
+R6.H = 13.0                                   -- torso-centre height (feet ~10)
+R6.camMeta = { color = {0.63,0.63,0.64}, size = {3.4,2.3,3.0} }
+
+local R6COLORS = {
+	Noob  = { Head={0.96,0.80,0.19}, Torso={0.05,0.41,0.67},
+	          ["Left Arm"]={0.96,0.80,0.19}, ["Right Arm"]={0.96,0.80,0.19},
+	          ["Left Leg"]={0.29,0.59,0.29},  ["Right Leg"]={0.29,0.59,0.29},
+	          HumanoidRootPart={0.05,0.41,0.67} },
+	Bacon = { Head={0.96,0.80,0.19}, Torso={0.39,0.05,0.05},
+	          ["Left Arm"]={0.96,0.80,0.19}, ["Right Arm"]={0.96,0.80,0.19},
+	          ["Left Leg"]={0.11,0.11,0.13},  ["Right Leg"]={0.11,0.11,0.13},
+	          HumanoidRootPart={0.39,0.05,0.05} },
+}
+-- local part offset from torso-centre + part size
+local R6PARTS = {
+	{"Torso",            Vector3.new(0,0,0),    Vector3.new(2,2,1)},
+	{"Head",             Vector3.new(0,1.5,0),  Vector3.new(2,1,1)},
+	{"Left Arm",         Vector3.new(-1.5,0,0), Vector3.new(1,2,1)},
+	{"Right Arm",        Vector3.new(1.5,0,0),  Vector3.new(1,2,1)},
+	{"Left Leg",         Vector3.new(-0.5,-2,0),Vector3.new(1,2,1)},
+	{"Right Leg",        Vector3.new(0.5,-2,0), Vector3.new(1,2,1)},
+	{"HumanoidRootPart", Vector3.new(0,0,0),    Vector3.new(2,2,1)},
+}
+
+-- actor = { name, base(short->CFrame), meta(short->{color,size}), face(rotCFrame) }
+function R6.makeActor(name, colorKey, pos, yaw)
+	local root = CFrame.new(pos) * CFrame.Angles(0, yaw, 0)
+	local a = { name=name, base={}, meta={}, face=CFrame.Angles(0,yaw,0) }
+	local cols = R6COLORS[colorKey] or R6COLORS.Noob
+	for _, p in ipairs(R6PARTS) do
+		local short, off, size = p[1], p[2], p[3]
+		a.base[short] = root * CFrame.new(off)
+		a.meta[short] = { color = cols[short] or {0.6,0.6,0.6}, size = {size.X,size.Y,size.Z} }
+	end
+	return a
+end
+
+local function actorSnap(a)
+	local s = {}
+	for k, cf in pairs(a.base) do s[k] = cf end
+	return s
+end
+
+local function rotAbout(snap, parts, pivotCF, rot)          -- rigid rotate about a pivot FRAME
+	local T = pivotCF * rot * pivotCF:Inverse()
+	for _, n in ipairs(parts) do
+		if snap[n] then snap[n] = T * snap[n] end
+	end
+end
+
+local ANG = CFrame.Angles
+-- pose one actor for one frame. params (radians / studs, all optional):
+--  lean(+fwd) turn headX(+down) headY  rSh(+fwd) lSh rShZ(+up) lShZ  rHip(+fwd) lHip
+--  fwd(+toward facing) side up   -> local-space body translation
+function R6.pose(a, prm)
+	prm = prm or {}
+	local s = actorSnap(a)
+	local restTorso = s["Torso"]
+	-- 1) waist: forward lean uses -X (this is the head-backwards fix) + optional turn
+	local upper = {"Torso","Head","Left Arm","Right Arm","HumanoidRootPart"}
+	rotAbout(s, upper, restTorso * CFrame.new(0,-1,0), ANG(-(prm.lean or 0), (prm.turn or 0), 0))
+	local torso = s["Torso"]
+	-- 2) head about neck
+	rotAbout(s, {"Head"}, torso * CFrame.new(0,1,0), ANG(-(prm.headX or 0), (prm.headY or 0), 0))
+	-- 3) arms about shoulders (arm hangs below pivot -> +X swings forward = punch)
+	rotAbout(s, {"Right Arm"}, torso * CFrame.new(1,0.5,0),  ANG(prm.rSh or 0, 0, -(prm.rShZ or 0)))
+	rotAbout(s, {"Left Arm"},  torso * CFrame.new(-1,0.5,0), ANG(prm.lSh or 0, 0,  (prm.lShZ or 0)))
+	-- 4) legs about hips (rest torso so a lean doesn't drag planted legs)
+	rotAbout(s, {"Right Leg"}, restTorso * CFrame.new(0.5,-1,0),  ANG(prm.rHip or 0,0,0))
+	rotAbout(s, {"Left Leg"},  restTorso * CFrame.new(-0.5,-1,0), ANG(prm.lHip or 0,0,0))
+	-- 5) local-space body translation (forward = actor facing)
+	local world = a.face:VectorToWorldSpace(Vector3.new(prm.side or 0, prm.up or 0, -(prm.fwd or 0)))
+	if world.Magnitude > 1e-5 then
+		for k, cf in pairs(s) do s[k] = cf + world end
+	end
+	return s
+end
+
+function R6.frameToPose(actors, snaps, camCF)
+	local pose = {}
+	for _, a in ipairs(actors) do
+		local s = snaps[a.name]
+		for short, cf in pairs(s) do
+			local m = a.meta[short]
+			pose[a.name.."."..short] = { cf={cf:GetComponents()}, color=m.color, size=m.size }
+		end
+	end
+	if camCF then
+		pose["Camera.CameraPart"] = { cf={camCF:GetComponents()}, color=R6.camMeta.color, size=R6.camMeta.size }
+	end
+	return pose
+end
+
+-- ---- effects ------------------------------------------------------
+local B62="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+local function rid() local t="" for i=1,16 do local n=rng6:NextInteger(1,62) t=t..string.sub(B62,n,n) end return t end
+function R6.fxExplosion(p)          return {id=rid(), type="explosion", position={p.X,p.Y,p.Z}} end
+function R6.fxChat(model, text)     return {id=rid(), type="chat", partParent=model, partName="Head", text=text} end
+function R6.fxSound(p, sid, vol, pitch) return {id=rid(), type="sound", soundId=sid, position={p.X,p.Y,p.Z}, pitch=pitch or 1, volume=vol or 0.5, offset=0} end
+function R6.fxMusic(p, sid, vol)    return {id=rid(), type="music", soundId=sid, position={p.X,p.Y,p.Z}, pitch=1, volume=vol or 0.4, offset=0} end
+
+function R6.cam(eye, look, shake)
+	if shake and shake > 0 then
+		eye = eye + Vector3.new((rng6:NextNumber()-0.5)*shake,(rng6:NextNumber()-0.5)*shake,(rng6:NextNumber()-0.5)*shake)
+	end
+	return CFrame.new(eye, look)
+end
+
+-- ---- keyframe samplers -------------------------------------------
+local FKEYS = {"lean","turn","headX","headY","rSh","lSh","rShZ","lShZ","rHip","lHip","fwd","side","up"}
+local function smooth(u) return u*u*(3-2*u) end
+local EASE = {
+	linear = function(u) return u end,
+	inout  = function(u) return u*u*(3-2*u) end,
+	["in"] = function(u) return u*u*u end,                 -- accelerate (whip into contact)
+	out    = function(u) return 1-(1-u)^3 end,             -- decelerate (settle)
+	snap   = function(u) return 1-(1-u)^5 end,             -- very fast then settle
+	back   = function(u) local s=1.7 return 1+(s+1)*(u-1)^3 + s*(u-1)^2 end, -- overshoot
+}
+local function sampleParams(beats, t)
+	if t <= beats[1].t then return beats[1] end
+	if t >= beats[#beats].t then return beats[#beats] end
+	for j=1,#beats-1 do
+		local A,B = beats[j], beats[j+1]
+		if t>=A.t and t<=B.t then
+			local u = (B.t>A.t) and (t-A.t)/(B.t-A.t) or 0
+			local e = (EASE[B.ease] or EASE.inout)(u)
+			local r = {}
+			for _,k in ipairs(FKEYS) do local av,bv=A[k] or 0,B[k] or 0 r[k]=av+(bv-av)*e end
+			return r
+		end
+	end
+	return beats[#beats]
+end
+local function sampleCam(cb, t)
+	if t <= cb[1].t then return cb[1] end
+	if t >= cb[#cb].t then return cb[#cb] end
+	for j=1,#cb-1 do
+		local A,B = cb[j], cb[j+1]
+		if t>=A.t and t<=B.t then
+			if B.cut then return A end                    -- hard cut at B.t
+			local u=(B.t>A.t) and (t-A.t)/(B.t-A.t) or 0
+			local e=smooth(u)
+			return { eye=A.eye:Lerp(B.eye,e), look=A.look:Lerp(B.look,e),
+			         shake=(A.shake or 0)+((B.shake or 0)-(A.shake or 0))*e }
+		end
+	end
+	return cb[#cb]
+end
+
+-- ---- multi-character build path (used by all R6 presets) ---------
+local function findModel(nm)
+	for _,folder in ipairs(workspace:GetChildren()) do
+		if folder:IsA("Folder") and folder:FindFirstChild("Models") then
+			local m = folder.Models:FindFirstChild(nm)
+			if m then return m end
+		end
+	end
+end
+function R6.build(spec, name, autosave, cb, speed)
+	State.building, State.cancel = true, false
+	local N = spec.frames
+	local avg = ((speed and speed.min or 0.02) + (speed and speed.max or 0.04)) / 2
+	local function eta(i) return math.max(0,(N-i))*avg + (#spec.ensure)*0.7 + 1.2 end
+
+	cb("Creating movie…", 0, N, eta(0))
+	invoke("RequestNewMovie"); task.wait(0.6)
+
+	-- clear any auto-spawned rig that isn't one of ours
+	cb("Clearing default rig…", 0, N, eta(0))
+	local wanted = {}
+	for _,e in ipairs(spec.ensure) do wanted[e.name]=true end
+	local DeleteModel = RemoteEvents and RemoteEvents:FindFirstChild("ToolsRelated")
+	                    and RemoteEvents.ToolsRelated:FindFirstChild("DeleteModel")
+	for _, folder in ipairs(workspace:GetChildren()) do
+		if folder:IsA("Folder") and folder:FindFirstChild("Models") then
+			for _, m in ipairs(folder.Models:GetChildren()) do
+				if m:IsA("Model") and not wanted[m.Name]
+				   and (m:FindFirstChild("Torso") or m:FindFirstChild("UpperTorso")) then
+					if DeleteModel then pcall(function() DeleteModel:FireServer(m) end) end
+				end
+			end
+		end
+	end
+	task.wait(0.3)
+
+	-- spawn our rigs (skip if already present)
+	for _, e in ipairs(spec.ensure) do
+		if not findModel(e.name) then
+			cb("Spawning "..e.name.."…", 0, N, eta(0))
+			if InsertModel then pcall(function() InsertModel:FireServer(e.name, CFrame.new(e.pos)) end) end
+			task.wait(0.5)
+		end
+	end
+
+	if spec.props then
+		cb("Building map…", 0, N, 0)
+		for _, pr in ipairs(spec.props) do
+			if InsertModel then pcall(function() InsertModel:FireServer(pr.name, pr.cf) end) end
+			task.wait(0.12)
+		end
+	end
+
+	invoke("SetSettings", CFG.settings)
+	if autosave and name and name ~= "" then
+		invoke("SetMetadata", { title = name, description = "MM4 Auto Animator v4 — R6" })
+	end
+
+	local first = spec.poseAt(1, N)
+	invoke("OverwriteFrame", 1, R6.frameToPose(spec.actors, first.snaps, first.cam))
+	if first.fx then for _,f in ipairs(first.fx) do invoke("AddEffect", 1, f) end end
+	cb("Posing…", 1, N, eta(1))
+
+	for i=2,N do
+		if State.cancel then break end
+		local fr = spec.poseAt(i, N)
+		invoke("InsertAfter", i-1, R6.frameToPose(spec.actors, fr.snaps, fr.cam))
+		if fr.fx then for _,f in ipairs(fr.fx) do invoke("AddEffect", i, f) end end
+		cb("Posing…", i, N, eta(i))
+		task.wait(rng6:NextNumber(speed and speed.min or 0.02, speed and speed.max or 0.04))
+	end
+
+	if not State.cancel then
+		if autosave then invoke("SaveMovie"); cb('Saved "'..(name or "")..'"', N, N, 0)
+		else cb("Frames built — open movie & Save to name it", N, N, 0) end
+	else cb("Cancelled", 0, N, 0) end
+	State.building = false
+	return not State.cancel
+end
+
+-- ================= R6 PRESET GENERATORS ===========================
+local function heroSpec(N, poseFn)      -- single R6 actor centred, facing camera
+	local hero = R6.makeActor("R6 Noob","Noob", Vector3.new(0,R6.H,0), 0)
+	return {
+		actors={hero}, ensure={{name="R6 Noob", pos=Vector3.new(0,R6.H,0)}}, frames=N,
+		poseAt=function(i,n)
+			local t=(i-1)/math.max(1,n-1)
+			local p, eye, look, shake = poseFn(t, n)
+			return { snaps={["R6 Noob"]=R6.pose(hero,p)}, cam=R6.cam(eye,look,shake or 0) }
+		end
+	}
+end
+
+function R6.specWalk(N)
+	local cyc = math.max(1, math.floor(N/18))
+	return heroSpec(N, function(t)
+		local ph=t*math.pi*2*cyc local s=math.sin(ph)
+		local p={ lean=rad(6), headX=rad(3), rHip=s*rad(38), lHip=-s*rad(38),
+		          rSh=-s*rad(26), lSh=s*rad(26), up=math.abs(math.sin(ph*2))*0.18 }
+		return p, Vector3.new(6+math.sin(t*math.pi*2)*1.5,15,-13), Vector3.new(0,13.8,0)
+	end)
+end
+
+function R6.specWave(N)
+	local oscCyc = math.max(2, math.floor(N/8))
+	return heroSpec(N, function(t)
+		local raise=math.min(1, t/0.25)
+		local p={ lean=rad(3), up=math.sin(t*math.pi*2)*0.05, headX=rad(-2), lSh=rad(6),
+		          rShZ=rad(140)*raise, rSh=math.sin(t*math.pi*2*oscCyc)*rad(22)*raise }
+		return p, Vector3.new(3,14.8,-11), Vector3.new(0,14,0)
+	end)
+end
+
+function R6.specIdle(N)
+	return heroSpec(N, function(t)
+		local b=math.sin(t*math.pi*2*2)
+		local p={ lean=rad(2)+b*rad(1.5), up=b*0.07, rSh=b*rad(4), lSh=-b*rad(4), rShZ=rad(6), lShZ=rad(6) }
+		return p, Vector3.new(5+math.sin(t*math.pi*2)*1,15,-12), Vector3.new(0,13.8,0)
+	end)
+end
+
+function R6.specRun(N)
+	local jump = {
+		{t=0.00, lean=rad(16), rSh=rad(30),  lSh=rad(30)},
+		{t=0.12, lean=rad(24), up=-0.7, rHip=rad(32), lHip=rad(32), rSh=rad(10),  lSh=rad(10)},
+		{t=0.22, lean=rad(6),  up=0.9,  rHip=-rad(12),lHip=-rad(12),rSh=rad(120), lSh=rad(120)},
+		{t=0.44, lean=rad(8),  up=6.0,  rHip=rad(48), lHip=rad(48), rSh=rad(130), lSh=rad(130)},
+		{t=0.66, lean=rad(6),  up=2.4,  rHip=rad(16), lHip=rad(16), rSh=rad(70),  lSh=rad(70)},
+		{t=0.85, lean=rad(26), up=-0.8, rHip=rad(40), lHip=rad(40), rSh=-rad(10), lSh=-rad(10)},
+		{t=1.00, lean=rad(8),  rSh=rad(20), lSh=rad(20)},
+	}
+	return heroSpec(N, function(t)
+		local p, eye, look
+		if t < 0.5 then
+			local ph=(t/0.5)*math.pi*2*3 local s=math.sin(ph)
+			p={ lean=rad(18), headX=rad(6), rHip=s*rad(46), lHip=-s*rad(46),
+			    rSh=-s*rad(40), lSh=s*rad(40), up=math.abs(s)*0.3 }
+			eye=Vector3.new(7,15,-12); look=Vector3.new(0,13.8,0)
+		else
+			p=sampleParams(jump,(t-0.5)/0.5)
+			eye=Vector3.new(4,12.5,-11); look=Vector3.new(0,15.5,0)   -- low hero angle in the air
+		end
+		return p, eye, look, 0
+	end)
+end
+
+-- ================= THE MULTI-CHARACTER FIGHT (600) ================
+function R6.specFight(N)
+	local noob = R6.makeActor("R6 Noob","Noob",  Vector3.new(-4,R6.H,0), -math.pi/2)
+	local baco = R6.makeActor("R6 Bacon","Bacon", Vector3.new( 4,R6.H,0),  math.pi/2)
+
+	local nb = {
+		{t=0.0000, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(6), fwd=0, ease="inout"},
+		{t=0.0150, lean=rad(12), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=1.9, ease="in"},
+		{t=0.0200, lean=rad(-6), rSh=rad(-38.0), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.0217, lean=rad(-6), rSh=rad(-38.0), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.0267, lean=rad(18), rSh=rad(104.0), lSh=rad(8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.0300, lean=rad(18), rSh=rad(104.0), lSh=rad(8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.0333, lean=rad(9), rSh=rad(66), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.0400, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.0450, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.0467, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.0517, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.0550, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.0583, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(22), lShZ=rad(22), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.0650, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.0700, lean=rad(-6), rSh=rad(34), lSh=rad(-39.9), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.0717, lean=rad(-6), rSh=rad(34), lSh=rad(-39.9), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.0767, lean=rad(18), rSh=rad(8), lSh=rad(109.2), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.0800, lean=rad(18), rSh=rad(8), lSh=rad(109.2), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.0833, lean=rad(9), rSh=rad(34), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.0900, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.0950, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.0967, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.1017, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(5), fwd=2.8, ease="out"},
+		{t=0.1050, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(5), fwd=2.8, ease="linear"},
+		{t=0.1083, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(5), fwd=2.8, ease="out"},
+		{t=0.1150, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.1200, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.1217, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.1267, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.1300, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.1333, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(22), lShZ=rad(22), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.1400, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.1450, lean=rad(-4), rSh=rad(-24), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16.799999999999997), fwd=3.1, ease="out"},
+		{t=0.1467, lean=rad(-4), rSh=rad(-24), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16.799999999999997), fwd=3.1, ease="linear"},
+		{t=0.1517, lean=rad(14), rSh=rad(84), lSh=rad(20), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(25.6), fwd=4.1, ease="in"},
+		{t=0.1550, lean=rad(14), rSh=rad(84), lSh=rad(20), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(25.6), fwd=4.1, ease="linear"},
+		{t=0.1583, lean=rad(9), rSh=rad(66), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.1650, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.1700, lean=rad(-6), rSh=rad(34), lSh=rad(-39.9), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.1717, lean=rad(-6), rSh=rad(34), lSh=rad(-39.9), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.1767, lean=rad(18), rSh=rad(8), lSh=rad(109.2), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.1800, lean=rad(18), rSh=rad(8), lSh=rad(109.2), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.1833, lean=rad(9), rSh=rad(34), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.1900, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.1950, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.1967, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.2017, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.2050, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.2083, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(22), lShZ=rad(22), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.2150, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.2200, lean=rad(-6), rSh=rad(-42.56), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.2217, lean=rad(-6), rSh=rad(-42.56), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.2267, lean=rad(18), rSh=rad(116.48000000000002), lSh=rad(8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.2300, lean=rad(18), rSh=rad(116.48000000000002), lSh=rad(8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.2333, lean=rad(9), rSh=rad(66), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.2400, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.2450, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.2467, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.2517, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.2550, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.2583, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(22), lShZ=rad(22), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.2650, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.2700, lean=rad(-8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), rHip=rad(-28), lHip=rad(16), turn=rad(-10), fwd=3.1, ease="out"},
+		{t=0.2717, lean=rad(-8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), rHip=rad(-28), lHip=rad(16), turn=rad(-10), fwd=3.1, ease="linear"},
+		{t=0.2767, lean=rad(-6), rSh=rad(-28), lSh=rad(70), rShZ=rad(22), lShZ=rad(22), headX=rad(5), rHip=rad(94), lHip=rad(-14), turn=rad(12), fwd=4.1, up=0.15, ease="in"},
+		{t=0.2800, lean=rad(-6), rSh=rad(-28), lSh=rad(70), rShZ=rad(22), lShZ=rad(22), headX=rad(5), rHip=rad(94), lHip=rad(-14), turn=rad(12), fwd=4.1, up=0.15, ease="linear"},
+		{t=0.2833, lean=rad(6), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), rHip=rad(22), fwd=3.4, ease="out"},
+		{t=0.2900, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.2950, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.2967, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.3017, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="out"},
+		{t=0.3050, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="linear"},
+		{t=0.3083, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(22), lShZ=rad(22), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.3150, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.3200, lean=rad(-6), rSh=rad(34), lSh=rad(-43.699999999999996), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.3217, lean=rad(-6), rSh=rad(34), lSh=rad(-43.699999999999996), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.3267, lean=rad(18), rSh=rad(8), lSh=rad(119.6), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.3300, lean=rad(18), rSh=rad(8), lSh=rad(119.6), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.3333, lean=rad(9), rSh=rad(34), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.3400, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.3450, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.3467, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.3517, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(5), fwd=2.8, ease="out"},
+		{t=0.3550, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(5), fwd=2.8, ease="linear"},
+		{t=0.3583, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(5), fwd=2.8, ease="out"},
+		{t=0.3650, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.3700, lean=rad(-4), rSh=rad(-24), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16.799999999999997), fwd=3.1, ease="out"},
+		{t=0.3717, lean=rad(-4), rSh=rad(-24), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16.799999999999997), fwd=3.1, ease="linear"},
+		{t=0.3767, lean=rad(14), rSh=rad(84), lSh=rad(20), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(25.6), fwd=4.1, ease="in"},
+		{t=0.3800, lean=rad(14), rSh=rad(84), lSh=rad(20), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(25.6), fwd=4.1, ease="linear"},
+		{t=0.3833, lean=rad(9), rSh=rad(66), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.3900, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.3950, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.3967, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.4017, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="out"},
+		{t=0.4050, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="linear"},
+		{t=0.4083, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(22), lShZ=rad(22), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.4150, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.4200, lean=rad(10), rSh=rad(-18), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), up=-0.35, fwd=3.1999999999999997, ease="out"},
+		{t=0.4217, lean=rad(10), rSh=rad(-18), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), up=-0.35, fwd=3.1999999999999997, ease="linear"},
+		{t=0.4267, lean=rad(22), rSh=rad(120), lSh=rad(16), rShZ=rad(22), lShZ=rad(22), headX=rad(5), up=0.5, fwd=4.2, ease="in"},
+		{t=0.4300, lean=rad(22), rSh=rad(120), lSh=rad(16), rShZ=rad(22), lShZ=rad(22), headX=rad(5), up=0.5, fwd=4.2, ease="linear"},
+		{t=0.4333, lean=rad(9), rSh=rad(66), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.4400, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.4450, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.4467, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.4517, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="out"},
+		{t=0.4550, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="linear"},
+		{t=0.4583, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(22), lShZ=rad(22), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.4650, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.4700, lean=rad(-4), rSh=rad(34), lSh=rad(-24), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16.799999999999997), fwd=3.1, ease="out"},
+		{t=0.4717, lean=rad(-4), rSh=rad(34), lSh=rad(-24), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16.799999999999997), fwd=3.1, ease="linear"},
+		{t=0.4767, lean=rad(14), rSh=rad(20), lSh=rad(84), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-25.6), fwd=4.1, ease="in"},
+		{t=0.4800, lean=rad(14), rSh=rad(20), lSh=rad(84), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-25.6), fwd=4.1, ease="linear"},
+		{t=0.4833, lean=rad(9), rSh=rad(34), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.4900, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.4950, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.4967, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.5017, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="out"},
+		{t=0.5050, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="linear"},
+		{t=0.5083, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(22), lShZ=rad(22), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.5150, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.5283, lean=rad(5), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(7), fwd=1.6, ease="out"},
+		{t=0.5400, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=1.4, side=0.6, turn=rad(8), ease="inout"},
+		{t=0.5517, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=1.4, side=-0.6, turn=rad(-8), ease="inout"},
+		{t=0.5550, lean=rad(-6), rSh=rad(-45.6), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.5567, lean=rad(-6), rSh=rad(-45.6), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.5600, lean=rad(18), rSh=rad(124.8), lSh=rad(8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.5617, lean=rad(18), rSh=rad(124.8), lSh=rad(8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.5650, lean=rad(9), rSh=rad(66), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.5700, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.5733, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.5750, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.5783, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.5800, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.5833, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(22), lShZ=rad(22), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.5883, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.5917, lean=rad(-6), rSh=rad(34), lSh=rad(-45.6), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.5933, lean=rad(-6), rSh=rad(34), lSh=rad(-45.6), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.5967, lean=rad(18), rSh=rad(8), lSh=rad(124.8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.5983, lean=rad(18), rSh=rad(8), lSh=rad(124.8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.6017, lean=rad(9), rSh=rad(34), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.6067, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.6100, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.6117, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="linear"},
+		{t=0.6150, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.6167, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.6200, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(22), lShZ=rad(22), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.6250, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="inout"},
+		{t=0.6350, lean=rad(-8), rSh=rad(-42), lSh=rad(-42), rShZ=rad(36), lShZ=rad(36), headX=rad(5), fwd=1.0, ease="out"},
+		{t=0.6400, lean=rad(-8), rSh=rad(-46), lSh=rad(-46), rShZ=rad(38), lShZ=rad(38), headX=rad(5), fwd=1.0, ease="linear"},
+		{t=0.6500, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=2.6, ease="inout"},
+		{t=0.6600, lean=rad(14), rSh=rad(-32), lSh=rad(-32), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=0.5, ease="out"},
+		{t=0.6667, lean=rad(20), rSh=rad(96), lSh=rad(-8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.2, turn=rad(14), ease="in"},
+		{t=0.6717, lean=rad(20), rSh=rad(96), lSh=rad(-8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.2, turn=rad(14), ease="linear"},
+		{t=0.6817, lean=rad(-10), rSh=rad(40), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(-16), fwd=2.6, ease="out"},
+		{t=0.6867, lean=rad(-6), rSh=rad(-51.300000000000004), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.6883, lean=rad(-6), rSh=rad(-51.300000000000004), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.6933, lean=rad(18), rSh=rad(130.0), lSh=rad(8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.6967, lean=rad(18), rSh=rad(130.0), lSh=rad(8), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.7000, lean=rad(9), rSh=rad(66), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.7067, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.7117, lean=rad(-4), rSh=rad(34), lSh=rad(-24), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16.799999999999997), fwd=3.1, ease="out"},
+		{t=0.7133, lean=rad(-4), rSh=rad(34), lSh=rad(-24), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(16.799999999999997), fwd=3.1, ease="linear"},
+		{t=0.7183, lean=rad(14), rSh=rad(20), lSh=rad(84), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-25.6), fwd=4.1, ease="in"},
+		{t=0.7217, lean=rad(14), rSh=rad(20), lSh=rad(84), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-25.6), fwd=4.1, ease="linear"},
+		{t=0.7250, lean=rad(9), rSh=rad(34), lSh=rad(66), rShZ=rad(22), lShZ=rad(22), headX=rad(5), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.7317, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.4, ease="inout"},
+		{t=0.7383, lean=rad(10), rSh=rad(-20), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.2, up=-0.35, ease="out"},
+		{t=0.7400, lean=rad(10), rSh=rad(-20), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.2, up=-0.35, ease="linear"},
+		{t=0.7450, lean=rad(24), rSh=rad(124), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.9, up=0.6, turn=rad(10), ease="in"},
+		{t=0.7500, lean=rad(24), rSh=rad(124), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.9, up=0.6, turn=rad(10), ease="linear"},
+		{t=0.7617, lean=rad(6), rSh=rad(60), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.3, ease="out"},
+		{t=0.7717, lean=rad(4), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.1, ease="in"},
+		{t=0.7800, lean=rad(6), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="out"},
+		{t=0.7950, lean=rad(4), rSh=rad(26), lSh=rad(26), rShZ=rad(22), lShZ=rad(22), headX=rad(7), fwd=2.6, ease="out"},
+		{t=0.8133, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=2.4, turn=rad(6), ease="inout"},
+		{t=0.8300, lean=rad(6), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=2.4, ease="inout"},
+		{t=0.8433, lean=rad(6), rSh=rad(30), lSh=rad(30), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=2.4, ease="inout"},
+		{t=0.8583, lean=rad(8), rSh=rad(32), lSh=rad(32), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=2.6, ease="in"},
+		{t=0.8650, lean=rad(-4), rSh=rad(-30), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, ease="out"},
+		{t=0.8700, lean=rad(-10), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(-8), fwd=3.2, side=0.5, ease="out"},
+		{t=0.8767, lean=rad(-8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.2, turn=rad(-16), rHip=rad(-24), lHip=rad(16), ease="out"},
+		{t=0.8783, lean=rad(-8), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.2, turn=rad(-16), rHip=rad(-24), lHip=rad(16), ease="linear"},
+		{t=0.8833, lean=rad(-6), rSh=rad(-28), lSh=rad(72), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.7, turn=rad(16), rHip=rad(96), lHip=rad(-14), ease="in"},
+		{t=0.8883, lean=rad(-6), rSh=rad(-28), lSh=rad(72), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.7, turn=rad(16), rHip=rad(96), lHip=rad(-14), ease="linear"},
+		{t=0.8983, lean=rad(6), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=3.0, rHip=rad(12), ease="out"},
+		{t=0.9083, lean=rad(4), rSh=rad(34), lSh=rad(34), rShZ=rad(22), lShZ=rad(22), headX=rad(5), fwd=2.8, ease="in"},
+		{t=0.9233, lean=rad(4), rSh=rad(-42), lSh=rad(26), rShZ=rad(42), lShZ=rad(22), headX=rad(-6), fwd=2.4, ease="out"},
+		{t=0.9400, lean=rad(2), rSh=rad(-52), lSh=rad(20), rShZ=rad(62), lShZ=rad(22), headX=rad(-10), fwd=2.2, ease="inout"},
+		{t=1.0000, lean=rad(2), rSh=rad(-52), lSh=rad(20), rShZ=rad(62), lShZ=rad(22), headX=rad(-10), fwd=2.2, ease="inout"},
+	}
+	local bb = {
+		{t=0.0000, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(5), fwd=0, ease="inout"},
+		{t=0.0150, lean=rad(11), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=1.9, ease="in"},
+		{t=0.0200, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.0217, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.0267, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(4), fwd=2.8, ease="out"},
+		{t=0.0300, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(4), fwd=2.8, ease="linear"},
+		{t=0.0333, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(4), fwd=2.8, ease="out"},
+		{t=0.0400, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.0450, lean=rad(-6), rSh=rad(32), lSh=rad(-38.0), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.0467, lean=rad(-6), rSh=rad(32), lSh=rad(-38.0), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.0517, lean=rad(18), rSh=rad(8), lSh=rad(104.0), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.0550, lean=rad(18), rSh=rad(8), lSh=rad(104.0), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.0583, lean=rad(9), rSh=rad(32), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.0650, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.0700, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.0717, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.0767, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.0800, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.0833, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.0900, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.0950, lean=rad(-6), rSh=rad(-38.0), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.0967, lean=rad(-6), rSh=rad(-38.0), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.1017, lean=rad(18), rSh=rad(104.0), lSh=rad(8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.1050, lean=rad(18), rSh=rad(104.0), lSh=rad(8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.1083, lean=rad(9), rSh=rad(66), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.1150, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.1200, lean=rad(-4), rSh=rad(-24), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-16.799999999999997), fwd=3.1, ease="out"},
+		{t=0.1217, lean=rad(-4), rSh=rad(-24), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-16.799999999999997), fwd=3.1, ease="linear"},
+		{t=0.1267, lean=rad(14), rSh=rad(84), lSh=rad(20), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(25.6), fwd=4.1, ease="in"},
+		{t=0.1300, lean=rad(14), rSh=rad(84), lSh=rad(20), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(25.6), fwd=4.1, ease="linear"},
+		{t=0.1333, lean=rad(9), rSh=rad(66), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.1400, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.1450, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.1467, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.1517, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.1550, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.1583, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.1650, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.1700, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.1717, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.1767, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(4), fwd=2.8, ease="out"},
+		{t=0.1800, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(4), fwd=2.8, ease="linear"},
+		{t=0.1833, lean=rad(5), rSh=rad(80), lSh=rad(80), rShZ=rad(34), lShZ=rad(34), headX=rad(4), fwd=2.8, ease="out"},
+		{t=0.1900, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.1950, lean=rad(-4), rSh=rad(32), lSh=rad(-24), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16.799999999999997), fwd=3.1, ease="out"},
+		{t=0.1967, lean=rad(-4), rSh=rad(32), lSh=rad(-24), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16.799999999999997), fwd=3.1, ease="linear"},
+		{t=0.2017, lean=rad(14), rSh=rad(20), lSh=rad(84), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-25.6), fwd=4.1, ease="in"},
+		{t=0.2050, lean=rad(14), rSh=rad(20), lSh=rad(84), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-25.6), fwd=4.1, ease="linear"},
+		{t=0.2083, lean=rad(9), rSh=rad(32), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.2150, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.2200, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.2217, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.2267, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.2300, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.2333, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.2400, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.2450, lean=rad(-6), rSh=rad(-42.56), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.2467, lean=rad(-6), rSh=rad(-42.56), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.2517, lean=rad(18), rSh=rad(116.48000000000002), lSh=rad(8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.2550, lean=rad(18), rSh=rad(116.48000000000002), lSh=rad(8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.2583, lean=rad(9), rSh=rad(66), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.2650, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.2700, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.2717, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.2767, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="out"},
+		{t=0.2800, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="linear"},
+		{t=0.2833, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.2900, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.2950, lean=rad(-8), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), rHip=rad(-28), lHip=rad(16), turn=rad(-10), fwd=3.1, ease="out"},
+		{t=0.2967, lean=rad(-8), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), rHip=rad(-28), lHip=rad(16), turn=rad(-10), fwd=3.1, ease="linear"},
+		{t=0.3017, lean=rad(-6), rSh=rad(-28), lSh=rad(70), rShZ=rad(20), lShZ=rad(20), headX=rad(4), rHip=rad(94), lHip=rad(-14), turn=rad(12), fwd=4.1, up=0.15, ease="in"},
+		{t=0.3050, lean=rad(-6), rSh=rad(-28), lSh=rad(70), rShZ=rad(20), lShZ=rad(20), headX=rad(4), rHip=rad(94), lHip=rad(-14), turn=rad(12), fwd=4.1, up=0.15, ease="linear"},
+		{t=0.3083, lean=rad(6), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), rHip=rad(22), fwd=3.4, ease="out"},
+		{t=0.3150, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.3200, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.3217, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.3267, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.3300, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.3333, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.3400, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.3450, lean=rad(-6), rSh=rad(32), lSh=rad(-41.800000000000004), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.3467, lean=rad(-6), rSh=rad(32), lSh=rad(-41.800000000000004), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.3517, lean=rad(18), rSh=rad(8), lSh=rad(114.4), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.3550, lean=rad(18), rSh=rad(8), lSh=rad(114.4), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.3583, lean=rad(9), rSh=rad(32), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.3650, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.3700, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.3717, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.3767, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="out"},
+		{t=0.3800, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="linear"},
+		{t=0.3833, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.3900, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.3950, lean=rad(10), rSh=rad(-18), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), up=-0.35, fwd=3.1999999999999997, ease="out"},
+		{t=0.3967, lean=rad(10), rSh=rad(-18), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), up=-0.35, fwd=3.1999999999999997, ease="linear"},
+		{t=0.4017, lean=rad(22), rSh=rad(120), lSh=rad(16), rShZ=rad(20), lShZ=rad(20), headX=rad(4), up=0.5, fwd=4.2, ease="in"},
+		{t=0.4050, lean=rad(22), rSh=rad(120), lSh=rad(16), rShZ=rad(20), lShZ=rad(20), headX=rad(4), up=0.5, fwd=4.2, ease="linear"},
+		{t=0.4083, lean=rad(9), rSh=rad(66), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.4150, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.4200, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.4217, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.4267, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="out"},
+		{t=0.4300, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="linear"},
+		{t=0.4333, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.4400, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.4450, lean=rad(-4), rSh=rad(32), lSh=rad(-24), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16.799999999999997), fwd=3.1, ease="out"},
+		{t=0.4467, lean=rad(-4), rSh=rad(32), lSh=rad(-24), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16.799999999999997), fwd=3.1, ease="linear"},
+		{t=0.4517, lean=rad(14), rSh=rad(20), lSh=rad(84), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-25.6), fwd=4.1, ease="in"},
+		{t=0.4550, lean=rad(14), rSh=rad(20), lSh=rad(84), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-25.6), fwd=4.1, ease="linear"},
+		{t=0.4583, lean=rad(9), rSh=rad(32), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.4650, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.4700, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.4717, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.4767, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.4800, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.4833, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.4900, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.4950, lean=rad(-6), rSh=rad(-49.4), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.4967, lean=rad(-6), rSh=rad(-49.4), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.5017, lean=rad(18), rSh=rad(130.0), lSh=rad(8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.5050, lean=rad(18), rSh=rad(130.0), lSh=rad(8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.5083, lean=rad(9), rSh=rad(66), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.5150, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.5283, lean=rad(5), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(7), fwd=1.6, ease="out"},
+		{t=0.5400, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=1.4, side=0.6, turn=rad(8), ease="inout"},
+		{t=0.5517, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=1.4, side=-0.6, turn=rad(-8), ease="inout"},
+		{t=0.5550, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.5567, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.5600, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.5617, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.5650, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.5700, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.5733, lean=rad(-6), rSh=rad(-45.6), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.5750, lean=rad(-6), rSh=rad(-45.6), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.5783, lean=rad(18), rSh=rad(124.8), lSh=rad(8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.5800, lean=rad(18), rSh=rad(124.8), lSh=rad(8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.5833, lean=rad(9), rSh=rad(66), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(6), fwd=3.4, ease="out"},
+		{t=0.5883, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.5917, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.5933, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.5967, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="out"},
+		{t=0.5983, lean=rad(-16.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.65, up=0, ease="linear"},
+		{t=0.6017, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.6067, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.6100, lean=rad(-6), rSh=rad(32), lSh=rad(-45.6), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(12), fwd=3.0, side=0.15, ease="out"},
+		{t=0.6117, lean=rad(-6), rSh=rad(32), lSh=rad(-45.6), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(12), fwd=3.0, side=0.15, ease="linear"},
+		{t=0.6150, lean=rad(18), rSh=rad(8), lSh=rad(124.8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-16), fwd=4.3, side=-0.1, ease="in"},
+		{t=0.6167, lean=rad(18), rSh=rad(8), lSh=rad(124.8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-16), fwd=4.3, side=-0.1, ease="linear"},
+		{t=0.6200, lean=rad(9), rSh=rad(32), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(4), turn=rad(-6), fwd=3.4, ease="out"},
+		{t=0.6250, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.4, ease="inout"},
+		{t=0.6350, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=2.6, ease="inout"},
+		{t=0.6400, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=2.6, ease="linear"},
+		{t=0.6500, lean=rad(-8), rSh=rad(-42), lSh=rad(-42), rShZ=rad(36), lShZ=rad(36), headX=rad(4), fwd=1.0, ease="out"},
+		{t=0.6600, lean=rad(14), rSh=rad(-32), lSh=rad(-32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=0.5, ease="out"},
+		{t=0.6667, lean=rad(20), rSh=rad(96), lSh=rad(-8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.2, turn=rad(14), ease="in"},
+		{t=0.6717, lean=rad(20), rSh=rad(96), lSh=rad(-8), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.2, turn=rad(14), ease="linear"},
+		{t=0.6817, lean=rad(-10), rSh=rad(40), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(-16), fwd=2.6, ease="out"},
+		{t=0.6867, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.6883, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.6933, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="out"},
+		{t=0.6967, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="linear"},
+		{t=0.7000, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.7067, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.7117, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.7133, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="linear"},
+		{t=0.7183, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="out"},
+		{t=0.7217, lean=rad(-24.0), rSh=rad(58), lSh=rad(66), rShZ=rad(20), lShZ=rad(20), headX=rad(-26), turn=rad(10), fwd=2.3, up=0.15, ease="linear"},
+		{t=0.7250, lean=rad(-9), rSh=rad(52), lSh=rad(60), rShZ=rad(20), lShZ=rad(20), headX=rad(-12), fwd=2.85, ease="out"},
+		{t=0.7317, lean=rad(7), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=3.0, ease="inout"},
+		{t=0.7383, lean=rad(-8), rSh=rad(44), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=2.2, ease="inout"},
+		{t=0.7400, lean=rad(-8), rSh=rad(44), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=2.2, ease="linear"},
+		{t=0.7450, lean=rad(-36), rSh=rad(150), lSh=rad(150), rShZ=rad(20), lShZ=rad(20), headX=rad(-32), fwd=1.6, up=1.8, turn=rad(20), rHip=rad(-30), lHip=rad(-40), ease="out"},
+		{t=0.7500, lean=rad(-38), rSh=rad(152), lSh=rad(152), rShZ=rad(20), lShZ=rad(20), headX=rad(-32), fwd=1.6, up=1.9, turn=rad(22), rHip=rad(-30), lHip=rad(-40), ease="linear"},
+		{t=0.7617, lean=rad(-60), rSh=rad(170), lSh=rad(170), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-3.5, up=3.2, turn=rad(120), ease="out"},
+		{t=0.7717, lean=rad(-80), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-6.5, up=0.6, turn=rad(160), rHip=rad(20), lHip=rad(10), ease="in"},
+		{t=0.7800, lean=rad(-88), rSh=rad(60), lSh=rad(20), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-8.5, up=-1.6, turn=rad(180), ease="out"},
+		{t=0.7950, lean=rad(-86), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-8.5, up=-1.6, turn=rad(180), ease="out"},
+		{t=0.8133, lean=rad(-40), rSh=rad(50), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-7.0, up=-0.6, turn=rad(150), ease="out"},
+		{t=0.8300, lean=rad(10), rSh=rad(40), lSh=rad(40), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-5.5, up=0.0, turn=rad(120), ease="inout"},
+		{t=0.8433, lean=rad(8), rSh=rad(34), lSh=rad(34), rShZ=rad(20), lShZ=rad(20), headX=rad(6), fwd=-4.0, turn=rad(90), ease="out"},
+		{t=0.8583, lean=rad(14), rSh=rad(-30), lSh=rad(-30), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-1.5, ease="in"},
+		{t=0.8650, lean=rad(18), rSh=rad(100), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=1.5, ease="in"},
+		{t=0.8700, lean=rad(20), rSh=rad(104), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=2.2, ease="out"},
+		{t=0.8767, lean=rad(6), rSh=rad(44), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=1.6, ease="inout"},
+		{t=0.8783, lean=rad(6), rSh=rad(44), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=1.6, ease="linear"},
+		{t=0.8833, lean=rad(-42), rSh=rad(150), lSh=rad(150), rShZ=rad(20), lShZ=rad(20), headX=rad(-32), fwd=-1.0, up=1.2, turn=rad(40), rHip=rad(-30), ease="out"},
+		{t=0.8883, lean=rad(-44), rSh=rad(150), lSh=rad(150), rShZ=rad(20), lShZ=rad(20), headX=rad(-32), fwd=-1.2, up=1.2, turn=rad(42), rHip=rad(-30), ease="linear"},
+		{t=0.8983, lean=rad(-60), rSh=rad(90), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-4.0, up=-0.5, turn=rad(110), ease="out"},
+		{t=0.9083, lean=rad(-88), rSh=rad(60), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-6.5, up=-1.6, turn=rad(170), ease="in"},
+		{t=0.9233, lean=rad(-88), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-6.5, up=-1.6, turn=rad(170), ease="out"},
+		{t=0.9400, lean=rad(-88), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-6.5, up=-1.6, turn=rad(170), ease="linear"},
+		{t=1.0000, lean=rad(-88), rSh=rad(32), lSh=rad(32), rShZ=rad(20), lShZ=rad(20), headX=rad(4), fwd=-6.5, up=-1.6, turn=rad(170), ease="linear"},
+	}
+	local cam = {
+		{t=0.0000, eye=Vector3.new(0,16.5,-18), look=Vector3.new(0,13.9,0), cut=true},
+		{t=0.0150, eye=Vector3.new(-1.5,14.4,-8.5), look=Vector3.new(0.5,14,0), cut=true},
+		{t=0.0267, eye=Vector3.new(-1.5,14.4,-8.5), look=Vector3.new(0.5,14,0), shake=0.35},
+		{t=0.0517, eye=Vector3.new(-1.5,14.4,-8.5), look=Vector3.new(0.5,14,0), shake=0.6},
+		{t=0.0767, eye=Vector3.new(-1.5,14.4,-8.5), look=Vector3.new(0.5,14,0), shake=0.6},
+		{t=0.1017, eye=Vector3.new(-1.5,14.4,-8.5), look=Vector3.new(0.5,14,0), shake=0.35},
+		{t=0.1150, eye=Vector3.new(3.2,14.3,-8), look=Vector3.new(0,14,0), cut=true},
+		{t=0.1267, eye=Vector3.new(3.2,14.3,-8), look=Vector3.new(0,14,0), shake=0.6},
+		{t=0.1517, eye=Vector3.new(3.2,14.3,-8), look=Vector3.new(0,14,0), shake=0.6},
+		{t=0.1767, eye=Vector3.new(3.2,14.3,-8), look=Vector3.new(0,14,0), shake=0.35},
+		{t=0.2017, eye=Vector3.new(3.2,14.3,-8), look=Vector3.new(0,14,0), shake=0.6},
+		{t=0.2150, eye=Vector3.new(0,15.2,-15), look=Vector3.new(0,13.9,0), cut=true},
+		{t=0.2267, eye=Vector3.new(0,15.2,-15), look=Vector3.new(0,13.9,0), shake=0.6},
+		{t=0.2517, eye=Vector3.new(0,15.2,-15), look=Vector3.new(0,13.9,0), shake=0.6},
+		{t=0.2650, eye=Vector3.new(-2,11.9,-10), look=Vector3.new(0.5,14,0), cut=true},
+		{t=0.2767, eye=Vector3.new(-1.4771617449399153,12.339184134250472,-7.908646979759661), look=Vector3.new(0.5,14,0), shake=1.5},
+		{t=0.2833, eye=Vector3.new(-2,11.9,-10), look=Vector3.new(0.5,14,0)},
+		{t=0.3017, eye=Vector3.new(-1.4771617449399153,12.339184134250472,-7.908646979759661), look=Vector3.new(0.5,14,0), shake=1.5},
+		{t=0.3083, eye=Vector3.new(-2,11.9,-10), look=Vector3.new(0.5,14,0)},
+		{t=0.3150, eye=Vector3.new(2,14.4,-8.5), look=Vector3.new(0,14,0), cut=true},
+		{t=0.3267, eye=Vector3.new(2,14.4,-8.5), look=Vector3.new(0,14,0), shake=0.6},
+		{t=0.3517, eye=Vector3.new(2,14.4,-8.5), look=Vector3.new(0,14,0), shake=0.35},
+		{t=0.3650, eye=Vector3.new(0,15,-14.5), look=Vector3.new(0,14,0), cut=true},
+		{t=0.3767, eye=Vector3.new(0.0,14.848635398446168,-12.305213277469438), look=Vector3.new(0,14,0), shake=1.5},
+		{t=0.3833, eye=Vector3.new(0,15,-14.5), look=Vector3.new(0,14,0)},
+		{t=0.4017, eye=Vector3.new(0.0,14.848635398446168,-12.305213277469438), look=Vector3.new(0,14,0), shake=1.5},
+		{t=0.4083, eye=Vector3.new(0,15,-14.5), look=Vector3.new(0,14,0)},
+		{t=0.4267, eye=Vector3.new(0.0,14.848635398446168,-12.305213277469438), look=Vector3.new(0,14,0), shake=1.5},
+		{t=0.4333, eye=Vector3.new(0,15,-14.5), look=Vector3.new(0,14,0)},
+		{t=0.4400, eye=Vector3.new(3.4,14.2,-8), look=Vector3.new(0,14,0), cut=true},
+		{t=0.4517, eye=Vector3.new(2.539718269353198,14.149395192314893,-5.975807692595761), look=Vector3.new(0,14,0), shake=1.5},
+		{t=0.4583, eye=Vector3.new(3.4,14.2,-8), look=Vector3.new(0,14,0)},
+		{t=0.4767, eye=Vector3.new(3.4,14.2,-8), look=Vector3.new(0,14,0), shake=0.6},
+		{t=0.5017, eye=Vector3.new(2.539718269353198,14.149395192314893,-5.975807692595761), look=Vector3.new(0,14,0), shake=1.5},
+		{t=0.5083, eye=Vector3.new(3.4,14.2,-8), look=Vector3.new(0,14,0)},
+		{t=0.5150, eye=Vector3.new(0,15.6,-16), look=Vector3.new(0,13.8,0), cut=true},
+		{t=0.5517, eye=Vector3.new(0,15,-14.5), look=Vector3.new(0,14,0), cut=true},
+		{t=0.5600, eye=Vector3.new(0,15,-14.5), look=Vector3.new(0,14,0), shake=0.6},
+		{t=0.5783, eye=Vector3.new(0,15,-14.5), look=Vector3.new(0,14,0), shake=0.6},
+		{t=0.5967, eye=Vector3.new(0,15,-14.5), look=Vector3.new(0,14,0), shake=0.6},
+		{t=0.6150, eye=Vector3.new(0,15,-14.5), look=Vector3.new(0,14,0), shake=0.6},
+		{t=0.6250, eye=Vector3.new(-6,13,-9), look=Vector3.new(-3,14,0), cut=true},
+		{t=0.6400, eye=Vector3.new(6,13,-9), look=Vector3.new(3,14,0), cut=true},
+		{t=0.6500, eye=Vector3.new(0,15,-16.5), look=Vector3.new(0,14,0), cut=true},
+		{t=0.6667, eye=Vector3.new(0.0,14.842712842955086,-13.904761908758903), look=Vector3.new(0,14,0), shake=1.6},
+		{t=0.6817, eye=Vector3.new(0,15,-16.5), look=Vector3.new(0,14,0)},
+		{t=0.6817, eye=Vector3.new(-3,13.7,-9), look=Vector3.new(1.2,14,0), cut=true},
+		{t=0.6933, eye=Vector3.new(-2.0700761148956808,13.766423134650308,-7.0073059604907435), look=Vector3.new(1.2,14,0), shake=1.5},
+		{t=0.7000, eye=Vector3.new(-3,13.7,-9), look=Vector3.new(1.2,14,0)},
+		{t=0.7183, eye=Vector3.new(-2.0700761148956808,13.766423134650308,-7.0073059604907435), look=Vector3.new(1.2,14,0), shake=1.5},
+		{t=0.7250, eye=Vector3.new(-3,13.7,-9), look=Vector3.new(1.2,14,0)},
+		{t=0.7450, eye=Vector3.new(-1.81646050986723,13.784538535009483,-6.463843949715493), look=Vector3.new(1.2,14,0), shake=1.7},
+		{t=0.7500, eye=Vector3.new(-3,13.7,-9), look=Vector3.new(1.2,14,0)},
+		{t=0.7500, eye=Vector3.new(6,16,-13), look=Vector3.new(6,14,0), cut=true},
+		{t=0.7800, eye=Vector3.new(6,16,-13), look=Vector3.new(6,14,0), shake=1.1},
+		{t=0.7800, eye=Vector3.new(3,13.6,-9), look=Vector3.new(-2,14,0), cut=true},
+		{t=0.8433, eye=Vector3.new(0,15,-15), look=Vector3.new(0,14,0), cut=true},
+		{t=0.8700, eye=Vector3.new(0,15,-15), look=Vector3.new(0,14,0), shake=0.35},
+		{t=0.8833, eye=Vector3.new(0.0,14.813746770533433,-12.206201558001496), look=Vector3.new(0,14,0), shake=1.7},
+		{t=0.8883, eye=Vector3.new(0,15,-15), look=Vector3.new(0,14,0)},
+		{t=0.9083, eye=Vector3.new(0,15,-15), look=Vector3.new(0,14,0), shake=0.9},
+		{t=0.9083, eye=Vector3.new(-5,13.6,-8), look=Vector3.new(-2,14.2,0), cut=true},
+		{t=0.9400, eye=Vector3.new(-4,17.5,-15), look=Vector3.new(-1,13.8,0)},
+	}
+	local fxT = {
+		{t=0.0000, f=function() return R6.fxMusic(Vector3.new(0,14,0),"rbxassetid://78972962223923",0.32) end},
+		{t=0.0000, f=function() return R6.fxChat("R6 Noob","Let's go.") end},
+		{t=0.0267, f=function() return R6.fxSound(Vector3.new(0.6,14.1,0),"rbxassetid://9117969687",0.6,1.25) end},
+		{t=0.0517, f=function() return R6.fxExplosion(Vector3.new(-0.7,14.1,0)) end},
+		{t=0.0517, f=function() return R6.fxSound(Vector3.new(-0.7,14.1,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.0517, f=function() return R6.fxChat("R6 Noob","tsk") end},
+		{t=0.0767, f=function() return R6.fxExplosion(Vector3.new(0.7,14.0,0)) end},
+		{t=0.0767, f=function() return R6.fxSound(Vector3.new(0.7,14.0,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.1017, f=function() return R6.fxSound(Vector3.new(-0.5,14.1,0),"rbxassetid://9117969687",0.6,1.25) end},
+		{t=0.1267, f=function() return R6.fxExplosion(Vector3.new(-0.8,14.0,0)) end},
+		{t=0.1267, f=function() return R6.fxSound(Vector3.new(-0.8,14.0,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.1450, f=function() return R6.fxChat("R6 Noob","c'mere!") end},
+		{t=0.1517, f=function() return R6.fxExplosion(Vector3.new(0.8,14.0,0)) end},
+		{t=0.1517, f=function() return R6.fxSound(Vector3.new(0.8,14.0,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.1767, f=function() return R6.fxSound(Vector3.new(0.5,14.1,0),"rbxassetid://9117969687",0.6,1.25) end},
+		{t=0.2017, f=function() return R6.fxExplosion(Vector3.new(-0.8,14.0,0)) end},
+		{t=0.2017, f=function() return R6.fxSound(Vector3.new(-0.8,14.0,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.2267, f=function() return R6.fxExplosion(Vector3.new(0.6,14.1,0)) end},
+		{t=0.2267, f=function() return R6.fxSound(Vector3.new(0.6,14.1,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.2517, f=function() return R6.fxExplosion(Vector3.new(-0.6,14.1,0)) end},
+		{t=0.2517, f=function() return R6.fxSound(Vector3.new(-0.6,14.1,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.2767, f=function() return R6.fxExplosion(Vector3.new(0.8,13.6,0)) end},
+		{t=0.2767, f=function() return R6.fxExplosion(Vector3.new(1.4,13.2,0)) end},
+		{t=0.2767, f=function() return R6.fxSound(Vector3.new(0.8,13.6,0),"rbxassetid://9117969687",1.0,0.8) end},
+		{t=0.2767, f=function() return R6.fxChat("R6 Bacon","agh!") end},
+		{t=0.3017, f=function() return R6.fxExplosion(Vector3.new(-0.7,13.6,0)) end},
+		{t=0.3017, f=function() return R6.fxExplosion(Vector3.new(-0.09999999999999998,13.2,0)) end},
+		{t=0.3017, f=function() return R6.fxSound(Vector3.new(-0.7,13.6,0),"rbxassetid://9117969687",1.0,0.8) end},
+		{t=0.3267, f=function() return R6.fxExplosion(Vector3.new(0.6,14.1,0)) end},
+		{t=0.3267, f=function() return R6.fxSound(Vector3.new(0.6,14.1,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.3517, f=function() return R6.fxSound(Vector3.new(-0.5,14.1,0),"rbxassetid://9117969687",0.6,1.25) end},
+		{t=0.3767, f=function() return R6.fxExplosion(Vector3.new(0.8,14.0,0)) end},
+		{t=0.3767, f=function() return R6.fxExplosion(Vector3.new(1.4,13.6,0)) end},
+		{t=0.3767, f=function() return R6.fxSound(Vector3.new(0.8,14.0,0),"rbxassetid://9117969687",1.0,0.8) end},
+		{t=0.3950, f=function() return R6.fxChat("R6 Bacon","up you go!") end},
+		{t=0.4017, f=function() return R6.fxExplosion(Vector3.new(-0.6,14.2,0)) end},
+		{t=0.4017, f=function() return R6.fxExplosion(Vector3.new(0.0,13.799999999999999,0)) end},
+		{t=0.4017, f=function() return R6.fxSound(Vector3.new(-0.6,14.2,0),"rbxassetid://9117969687",1.0,0.8) end},
+		{t=0.4267, f=function() return R6.fxExplosion(Vector3.new(0.6,14.2,0)) end},
+		{t=0.4267, f=function() return R6.fxExplosion(Vector3.new(1.2,13.799999999999999,0)) end},
+		{t=0.4267, f=function() return R6.fxSound(Vector3.new(0.6,14.2,0),"rbxassetid://9117969687",1.0,0.8) end},
+		{t=0.4517, f=function() return R6.fxExplosion(Vector3.new(-0.8,14.0,0)) end},
+		{t=0.4517, f=function() return R6.fxExplosion(Vector3.new(-0.20000000000000007,13.6,0)) end},
+		{t=0.4517, f=function() return R6.fxSound(Vector3.new(-0.8,14.0,0),"rbxassetid://9117969687",1.0,0.8) end},
+		{t=0.4767, f=function() return R6.fxExplosion(Vector3.new(0.7,14.0,0)) end},
+		{t=0.4767, f=function() return R6.fxSound(Vector3.new(0.7,14.0,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.5017, f=function() return R6.fxExplosion(Vector3.new(-0.6,14.1,0)) end},
+		{t=0.5017, f=function() return R6.fxExplosion(Vector3.new(0.0,13.7,0)) end},
+		{t=0.5017, f=function() return R6.fxSound(Vector3.new(-0.6,14.1,0),"rbxassetid://9117969687",1.0,0.8) end},
+		{t=0.5283, f=function() return R6.fxChat("R6 Bacon","you're strong...") end},
+		{t=0.5517, f=function() return R6.fxChat("R6 Noob","not done yet.") end},
+		{t=0.5600, f=function() return R6.fxExplosion(Vector3.new(0.6,14.1,0)) end},
+		{t=0.5600, f=function() return R6.fxSound(Vector3.new(0.6,14.1,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.5783, f=function() return R6.fxExplosion(Vector3.new(-0.6,14.1,0)) end},
+		{t=0.5783, f=function() return R6.fxSound(Vector3.new(-0.6,14.1,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.5967, f=function() return R6.fxExplosion(Vector3.new(0.7,14.1,0)) end},
+		{t=0.5967, f=function() return R6.fxSound(Vector3.new(0.7,14.1,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.6150, f=function() return R6.fxExplosion(Vector3.new(-0.7,14.1,0)) end},
+		{t=0.6150, f=function() return R6.fxSound(Vector3.new(-0.7,14.1,0),"rbxassetid://9117969687",1.0,1.0) end},
+		{t=0.6350, f=function() return R6.fxExplosion(Vector3.new(-4,13.4,0)) end},
+		{t=0.6350, f=function() return R6.fxExplosion(Vector3.new(-4,15.2,0)) end},
+		{t=0.6350, f=function() return R6.fxSound(Vector3.new(-4,14,0),"rbxassetid://9117969687",0.8,1.4) end},
+		{t=0.6350, f=function() return R6.fxChat("R6 Noob","HAAAA!") end},
+		{t=0.6500, f=function() return R6.fxExplosion(Vector3.new(4,13.4,0)) end},
+		{t=0.6500, f=function() return R6.fxExplosion(Vector3.new(4,15.2,0)) end},
+		{t=0.6500, f=function() return R6.fxSound(Vector3.new(4,14,0),"rbxassetid://9117969687",0.8,1.4) end},
+		{t=0.6500, f=function() return R6.fxChat("R6 Bacon","RRAAH!") end},
+		{t=0.6667, f=function() return R6.fxExplosion(Vector3.new(0,14.2,0)) end},
+		{t=0.6667, f=function() return R6.fxExplosion(Vector3.new(0,15.2,0)) end},
+		{t=0.6667, f=function() return R6.fxSound(Vector3.new(0,14,0),"rbxassetid://9117969687",1.0,0.75) end},
+		{t=0.6933, f=function() return R6.fxExplosion(Vector3.new(0.8,14.1,0)) end},
+		{t=0.6933, f=function() return R6.fxExplosion(Vector3.new(1.4,13.7,0)) end},
+		{t=0.6933, f=function() return R6.fxSound(Vector3.new(0.8,14.1,0),"rbxassetid://9117969687",1.0,0.8) end},
+		{t=0.7183, f=function() return R6.fxExplosion(Vector3.new(0.6,14.0,0)) end},
+		{t=0.7183, f=function() return R6.fxExplosion(Vector3.new(1.2,13.6,0)) end},
+		{t=0.7183, f=function() return R6.fxSound(Vector3.new(0.6,14.0,0),"rbxassetid://9117969687",1.0,0.8) end},
+		{t=0.7450, f=function() return R6.fxExplosion(Vector3.new(0.7,14.7,0)) end},
+		{t=0.7450, f=function() return R6.fxExplosion(Vector3.new(0.7,15.6,0)) end},
+		{t=0.7450, f=function() return R6.fxExplosion(Vector3.new(1.3,14.2,0)) end},
+		{t=0.7450, f=function() return R6.fxSound(Vector3.new(0.7,14.5,0),"rbxassetid://9117969687",1.0,0.7) end},
+		{t=0.7450, f=function() return R6.fxChat("R6 Bacon","GAAAH!") end},
+		{t=0.7800, f=function() return R6.fxExplosion(Vector3.new(11,11.2,0)) end},
+		{t=0.7800, f=function() return R6.fxExplosion(Vector3.new(12,11.2,0)) end},
+		{t=0.7800, f=function() return R6.fxSound(Vector3.new(11,11,0),"rbxassetid://9117969687",1.0,0.6) end},
+		{t=0.8133, f=function() return R6.fxChat("R6 Bacon","...not...yet") end},
+		{t=0.8433, f=function() return R6.fxChat("R6 Bacon","ONE MORE!") end},
+		{t=0.8700, f=function() return R6.fxSound(Vector3.new(1.0,14,0),"rbxassetid://9117969687",0.5,1.3) end},
+		{t=0.8833, f=function() return R6.fxExplosion(Vector3.new(0.8,13.8,0)) end},
+		{t=0.8833, f=function() return R6.fxExplosion(Vector3.new(1.4,14.4,0)) end},
+		{t=0.8833, f=function() return R6.fxExplosion(Vector3.new(0.8,15,0)) end},
+		{t=0.8833, f=function() return R6.fxSound(Vector3.new(0.8,14,0),"rbxassetid://9117969687",1.0,0.7) end},
+		{t=0.8833, f=function() return R6.fxChat("R6 Bacon","GLK!") end},
+		{t=0.9083, f=function() return R6.fxExplosion(Vector3.new(10.5,11.2,0)) end},
+		{t=0.9083, f=function() return R6.fxSound(Vector3.new(10.5,11,0),"rbxassetid://9117969687",1.0,0.6) end},
+		{t=0.9233, f=function() return R6.fxChat("R6 Noob","Stay down.") end},
+		{t=0.9400, f=function() return R6.fxChat("R6 Noob","GG.") end},
+	}
+
+	local fxByFrame = {}
+	for _,e in ipairs(fxT) do
+		local idx = math.clamp(math.floor(e.t*(N-1)+0.5)+1, 1, N)
+		fxByFrame[idx] = fxByFrame[idx] or {}
+		table.insert(fxByFrame[idx], e.f())
+	end
+
+	return {
+		actors = { noob, baco },
+		ensure = { {name="R6 Noob", pos=Vector3.new(-4,R6.H,0)}, {name="R6 Bacon", pos=Vector3.new(4,R6.H,0)} },
+		props = {
+			{name="Big Dead Tree", cf=CFrame.new(-14,10,9)},
+			{name="Big Dead Tree", cf=CFrame.new(13,10,10)},
+			{name="Pine Tree", cf=CFrame.new(-11,10,11)},
+			{name="Pine Tree", cf=CFrame.new(10,10,12)},
+			{name="Rock", cf=CFrame.new(-9,10,8)},
+			{name="Rock", cf=CFrame.new(8,10,9)},
+			{name="Rock", cf=CFrame.new(0,10,12)},
+			{name="Fence", cf=CFrame.new(-9,10,10)},
+			{name="Fence", cf=CFrame.new(-3,10,10)},
+			{name="Fence", cf=CFrame.new(3,10,10)},
+			{name="Fence", cf=CFrame.new(9,10,10)},
+			{name="Dumpster", cf=CFrame.new(13,10,5)},
+			{name="Barrier", cf=CFrame.new(-13,10,4)},
+			{name="Traffic Cone", cf=CFrame.new(-7,10,5)},
+			{name="Traffic Cone", cf=CFrame.new(7,10,5)},
+			{name="Tree Log", cf=CFrame.new(-4,10,7)},
+			{name="Bush", cf=CFrame.new(3,10,9)},
+			{name="Bush", cf=CFrame.new(-10,10,6)},
+			{name="Stone Tiles", cf=CFrame.new(0,9.5,0)},
+		},
+		frames = N,
+		poseAt = function(i,n)
+			local t=(i-1)/math.max(1,n-1)
+			local c=sampleCam(cam,t)
+			return {
+				snaps = { ["R6 Noob"]=R6.pose(noob, sampleParams(nb,t)),
+				          ["R6 Bacon"]=R6.pose(baco, sampleParams(bb,t)) },
+				cam = R6.cam(c.eye, c.look, c.shake or 0),
+				fx = fxByFrame[i],
+			}
+		end
+	}
+end
+
+-- register R6 presets at the FRONT (originals kept below, nothing deleted)
+local function mkR6(id,label,desc,frames,specFn)
+	return { id=id, label=label, desc=desc, frames=frames,
+		gen=function() return {} end,
+		customBuild=function(name, frameCount, speed, autosave, cb)
+			local spec = specFn(frameCount); spec.frames = frameCount
+			return R6.build(spec, name, autosave, cb, speed)
+		end }
+end
+table.insert(PRESETS, 1, mkR6("fight", "Epic Fight (R6 · 2 chars)", "Noob vs Bacon: combos, kick KO, FX, dialogue, cinematic cuts.", 600, R6.specFight))
+table.insert(PRESETS, 2, mkR6("r6run",  "R6 Run + Jump", "Run cycle -> crouch -> launch -> apex -> land (head correct).", 64, R6.specRun))
+table.insert(PRESETS, 3, mkR6("r6walk", "R6 Walk",       "Weight-shifted R6 walk cycle.", 40, R6.specWalk))
+table.insert(PRESETS, 4, mkR6("r6wave", "R6 Wave",       "Arm raise + oscillating hand wave.", 20, R6.specWave))
+table.insert(PRESETS, 5, mkR6("r6idle", "R6 Idle",       "Breathing idle filler.", 28, R6.specIdle))
+
+-------------------------------------------------------------------
+-- GUI  (compact landscape · minimizable · corner-anchored)
+-------------------------------------------------------------------
+local C = {
+	bg    = Color3.fromRGB(22,22,27),  panel = Color3.fromRGB(31,31,38),
+	panel2= Color3.fromRGB(44,44,54),  text  = Color3.fromRGB(236,236,241),
+	sub   = Color3.fromRGB(150,150,162),accent= Color3.fromRGB(99,102,241),
+	good  = Color3.fromRGB(46,204,113), bad   = Color3.fromRGB(231,76,60),
+	track = Color3.fromRGB(52,52,63),
+}
+local function corner(o,r) local u=Instance.new("UICorner");u.CornerRadius=UDim.new(0,r or 6);u.Parent=o end
+local function mk(cls,props,parent) local o=Instance.new(cls);for k,v in pairs(props) do o[k]=v end;o.Parent=parent;return o end
+
+local guiParent = (gethui and gethui()) or game:FindService("CoreGui") or Players.LocalPlayer:WaitForChild("PlayerGui")
+local old = guiParent:FindFirstChild("MM4AutoAnimator"); if old then old:Destroy() end
+
+local W, H, TITLE = 430, 150, 30
+local sg = mk("ScreenGui",{Name="MM4AutoAnimator",ResetOnSpawn=false,IgnoreGuiInset=true,
+	ZIndexBehavior=Enum.ZIndexBehavior.Sibling},guiParent)
+
+local main = mk("Frame",{Size=UDim2.new(0,W,0,H),Position=UDim2.new(0,16,0,16),
+	BackgroundColor3=C.bg,BorderSizePixel=0,Active=true},sg)
+corner(main,10); mk("UIStroke",{Color=C.panel2,Thickness=1},main)
+
+-- title bar
+local bar = mk("Frame",{Size=UDim2.new(1,0,0,TITLE),BackgroundColor3=C.panel,BorderSizePixel=0},main)
+corner(bar,10)
+mk("Frame",{Size=UDim2.new(1,0,0,10),Position=UDim2.new(0,0,1,-10),BackgroundColor3=C.panel,BorderSizePixel=0},bar)
+mk("TextLabel",{Size=UDim2.new(1,-70,1,0),Position=UDim2.new(0,12,0,0),BackgroundTransparency=1,
+	Font=Enum.Font.GothamBold,Text="🎬 MM4 Auto Animator",TextColor3=C.text,TextSize=13,
+	TextXAlignment=Enum.TextXAlignment.Left},bar)
+local minBtn = mk("TextButton",{Size=UDim2.new(0,26,0,22),Position=UDim2.new(1,-62,0,4),
+	BackgroundColor3=C.panel2,Text="–",TextColor3=C.text,Font=Enum.Font.GothamBold,TextSize=16},bar); corner(minBtn,6)
+local closeBtn = mk("TextButton",{Size=UDim2.new(0,26,0,22),Position=UDim2.new(1,-30,0,4),
+	BackgroundColor3=C.panel2,Text="✕",TextColor3=C.text,Font=Enum.Font.GothamBold,TextSize=12},bar); corner(closeBtn,6)
+
+-- content
+local content = mk("Frame",{Size=UDim2.new(1,0,1,-TITLE),Position=UDim2.new(0,0,0,TITLE),
+	BackgroundTransparency=1},main)
+
+local function tag(txt,x,y,w)
+	return mk("TextLabel",{Size=UDim2.new(0,w,0,12),Position=UDim2.new(0,x,0,y),BackgroundTransparency=1,
+		Font=Enum.Font.GothamMedium,Text=txt,TextColor3=C.sub,TextSize=10,
+		TextXAlignment=Enum.TextXAlignment.Left},content)
+end
+
+-- LEFT column: name + preset cycler
+tag("PROJECT NAME",12,6,180)
+local nameBox = mk("TextBox",{Size=UDim2.new(0,196,0,28),Position=UDim2.new(0,12,0,20),
+	BackgroundColor3=C.panel,BorderSizePixel=0,Font=Enum.Font.Gotham,PlaceholderText="Type a name…",
+	Text="",TextColor3=C.text,PlaceholderColor3=C.sub,TextSize=13,ClearTextOnFocus=false,
+	TextXAlignment=Enum.TextXAlignment.Left},content); corner(nameBox,6)
+mk("UIPadding",{PaddingLeft=UDim.new(0,8)},nameBox)
+
+tag("PRESET  (tap to cycle)",12,54,190)
+local presetBtn = mk("TextButton",{Size=UDim2.new(0,196,0,28),Position=UDim2.new(0,12,0,68),
+	BackgroundColor3=C.panel2,BorderSizePixel=0,Font=Enum.Font.GothamBold,Text="",TextColor3=C.text,
+	TextSize=13},content); corner(presetBtn,6)
+mk("UIStroke",{Color=C.accent,Thickness=1.5},presetBtn)
+local presetDesc = mk("TextLabel",{Size=UDim2.new(0,196,0,12),Position=UDim2.new(0,12,0,99),
+	BackgroundTransparency=1,Font=Enum.Font.Gotham,Text="",TextColor3=C.sub,TextSize=10,
+	TextXAlignment=Enum.TextXAlignment.Left},content)
+
+-- RIGHT column: frames + speed + eta + autosave
+tag("FRAMES",220,6,60); tag("SPEED (tap)",286,6,130)
+local framesBox = mk("TextBox",{Size=UDim2.new(0,58,0,28),Position=UDim2.new(0,220,0,20),
+	BackgroundColor3=C.panel,BorderSizePixel=0,Font=Enum.Font.GothamBold,Text="32",TextColor3=C.text,
+	TextSize=14,ClearTextOnFocus=false},content); corner(framesBox,6)
+local speedBtn = mk("TextButton",{Size=UDim2.new(0,128,0,28),Position=UDim2.new(0,286,0,20),
+	BackgroundColor3=C.panel2,BorderSizePixel=0,Font=Enum.Font.GothamBold,Text="Fast",TextColor3=C.text,
+	TextSize=13},content); corner(speedBtn,6)
+mk("UIStroke",{Color=C.accent,Thickness=1.5},speedBtn)
+
+local etaLabel = mk("TextLabel",{Size=UDim2.new(0,196,0,14),Position=UDim2.new(0,220,0,54),
+	BackgroundTransparency=1,Font=Enum.Font.GothamMedium,Text="",TextColor3=C.text,TextSize=11,
+	TextXAlignment=Enum.TextXAlignment.Left},content)
+
+local autoBox = mk("TextButton",{Size=UDim2.new(0,18,0,18),Position=UDim2.new(0,220,0,72),
+	BackgroundColor3=C.panel,BorderSizePixel=0,Text=""},content); corner(autoBox,4)
+local autoChk = mk("TextLabel",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Text="",
+	Font=Enum.Font.GothamBold,TextColor3=C.good,TextSize=13},autoBox)
+mk("TextLabel",{Size=UDim2.new(0,170,0,18),Position=UDim2.new(0,242,0,72),BackgroundTransparency=1,
+	Font=Enum.Font.Gotham,Text="Auto-save with name",TextColor3=C.sub,TextSize=11,
+	TextXAlignment=Enum.TextXAlignment.Left},content)
+
+-- BOTTOM: progress + status + build/stop
+local progBG = mk("Frame",{Size=UDim2.new(0,258,0,7),Position=UDim2.new(0,12,0,98),
+	BackgroundColor3=C.track,BorderSizePixel=0},content); corner(progBG,4)
+local progFill = mk("Frame",{Size=UDim2.new(0,0,1,0),BackgroundColor3=C.accent,BorderSizePixel=0},progBG)
+corner(progFill,4)
+local statusLbl = mk("TextLabel",{Size=UDim2.new(0,258,0,12),Position=UDim2.new(0,12,0,108),
+	BackgroundTransparency=1,Font=Enum.Font.Gotham,Text="Idle",TextColor3=C.sub,TextSize=10,
+	TextXAlignment=Enum.TextXAlignment.Left},content)
+local buildBtn = mk("TextButton",{Size=UDim2.new(0,134,0,28),Position=UDim2.new(0,282,0,92),
+	BackgroundColor3=C.good,BorderSizePixel=0,Font=Enum.Font.GothamBold,Text="▶ BUILD",
+	TextColor3=Color3.new(1,1,1),TextSize=14},content); corner(buildBtn,6)
+local cancelBtn = mk("TextButton",{Size=UDim2.new(0,134,0,28),Position=UDim2.new(0,282,0,92),
+	BackgroundColor3=C.bad,BorderSizePixel=0,Font=Enum.Font.GothamBold,Text="■ STOP",
+	TextColor3=Color3.new(1,1,1),TextSize=14,Visible=false},content); corner(cancelBtn,6)
+
+-- state + cyclers
+local pIdx, sIdx, autoOn = 1, 1, true
+local function fmtTime(sec) sec=math.max(0,math.floor(sec+0.5)); return string.format("%d:%02d",math.floor(sec/60),sec%60) end
+local function refreshETA()
+	local fc = tonumber(framesBox.Text) or PRESETS[pIdx].frames
+	local buildSec = etaSeconds(fc, SPEEDS[sIdx])
+	local movieSec = fc / (CFG.settings.fps or 15)
+	etaLabel.Text = string.format("⏱ build ~%s  · clip ~%.1fs", fmtTime(buildSec), movieSec)
+end
+local function applyPreset()
+	local p = PRESETS[pIdx]
+	presetBtn.Text = "◆ "..p.label
+	presetDesc.Text = p.desc
+	framesBox.Text = tostring(p.frames)
+	refreshETA()
+end
+presetBtn.MouseButton1Click:Connect(function() pIdx = pIdx % #PRESETS + 1; applyPreset() end)
+speedBtn.MouseButton1Click:Connect(function() sIdx = sIdx % #SPEEDS + 1; speedBtn.Text = SPEEDS[sIdx].label; refreshETA() end)
+framesBox:GetPropertyChangedSignal("Text"):Connect(refreshETA)
+autoBox.MouseButton1Click:Connect(function() autoOn=not autoOn; autoChk.Text=autoOn and "✓" or ""; autoBox.BackgroundColor3=autoOn and C.panel2 or C.panel end)
+applyPreset()
+autoChk.Text="✓"; autoBox.BackgroundColor3=C.panel2   -- auto-save ON by default
+
+-- progress callback
+local function onProgress(stage,i,total,remain)
+	local a = (total>0) and (i/total) or 0
+	progFill:TweenSize(UDim2.new(a,0,1,0),Enum.EasingDirection.Out,Enum.EasingStyle.Quad,0.15,true)
+	statusLbl.TextColor3 = C.sub
+	statusLbl.Text = (i>0 and total>0) and string.format("%s  %d/%d",stage,i,total) or stage
+	if remain and remain>0 then etaLabel.Text="⏱ "..fmtTime(remain)
+	elseif total>0 and i>=total then etaLabel.Text="✅ Done" end
+end
+
+buildBtn.MouseButton1Click:Connect(function()
+	if State.building then return end
+	local nm = nameBox.Text:gsub("^%s+",""):gsub("%s+$","")
+	if nm=="" then statusLbl.Text="⚠ Enter a project name"; statusLbl.TextColor3=C.bad; nameBox:CaptureFocus(); return end
+	local fc = math.clamp(math.floor(tonumber(framesBox.Text) or PRESETS[pIdx].frames),2,600)
+	framesBox.Text=tostring(fc)
+	buildBtn.Visible=false; cancelBtn.Visible=true
+	task.spawn(function()
+		buildMovie(PRESETS[pIdx], nm, fc, SPEEDS[sIdx], true, onProgress)
+		buildBtn.Visible=true; cancelBtn.Visible=false
+	end)
+end)
+cancelBtn.MouseButton1Click:Connect(function() State.cancel=true; statusLbl.Text="Stopping…" end)
+closeBtn.MouseButton1Click:Connect(function() State.cancel=true; sg:Destroy() end)
+
+-- minimize
+local minimized=false
+minBtn.MouseButton1Click:Connect(function()
+	minimized=not minimized
+	content.Visible=not minimized
+	main.Size = minimized and UDim2.new(0,W,0,TITLE) or UDim2.new(0,W,0,H)
+	minBtn.Text = minimized and "+" or "–"
+end)
+
+-- dragging (mouse + touch), from the title bar
+do
+	local drag,ds,sp
+	bar.InputBegan:Connect(function(i)
+		if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+			drag=true; ds=i.Position; sp=main.Position
+		end
+	end)
+	UIS.InputChanged:Connect(function(i)
+		if drag and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+			local d=i.Position-ds
+			main.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y)
+		end
+	end)
+	UIS.InputEnded:Connect(function(i)
+		if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then drag=false end
+	end)
+end
+
+print("[MM4] Auto Animator v3.2 (compact) loaded — remotes:",
+	RF.RequestNewMovie~=nil, RF.InsertAfter~=nil)
