@@ -1,0 +1,673 @@
+--[[
+    ==================================================================
+      FNAF 1  ::  UNIVERSAL HUB   (Delta Executor / Fluent UI)
+      Built from live dump of PlaceId 12497348201
+    ------------------------------------------------------------------
+      TABS
+        - Automation   : auto-door (proximity), auto-Foxy, auto-cam,
+                         auto-task, master toggles
+        - Auto Play    : full night bot, plays 12AM->6AM for you,
+                         auto-advances all nights
+        - Visuals      : animatronic ESP (highlight + name + distance)
+        - Manual       : fire any control by hand (doors/lights/cams)
+        - Config       : distances, intervals, keybinds, save/load
+    ------------------------------------------------------------------
+      DOOR/LIGHT CONTROL (mobile + PC, zero setup)
+        Every door & light has a ClickDetector. The script triggers
+        them with fireclickdetector(), so nothing needs to be pressed
+        or tapped on any platform. Fallback chain if that ever fails:
+        learned replay -> OfficeControls.<side>Event -> click remote.
+    ==================================================================
+]]
+
+--========================== SERVICES ==============================--
+local Players     = game:GetService("Players")
+local RS          = game:GetService("ReplicatedStorage")
+local RunService  = game:GetService("RunService")
+local StarterGui  = game:GetService("StarterGui")
+local Workspace   = game:GetService("Workspace")
+local HttpService = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+
+--========================== FILE I/O ==============================--
+local FOLDER    = "FNAF_Hub"
+local LEARN_FILE = FOLDER .. "/learned.txt"
+if makefolder and isfolder and not isfolder(FOLDER) then makefolder(FOLDER) end
+
+local function saveLearned(tbl)
+    if writefile then pcall(writefile, LEARN_FILE, HttpService:JSONEncode(tbl)) end
+end
+local function loadLearned()
+    if isfile and isfile(LEARN_FILE) and readfile then
+        local ok, data = pcall(function() return HttpService:JSONDecode(readfile(LEARN_FILE)) end)
+        if ok and type(data) == "table" then return data end
+    end
+    return {}
+end
+
+--========================== CONFIG ================================--
+local Config = {
+    -- proximity
+    DoorTriggerDistance = 28,   -- studs: close door when animatronic within
+    DoorReopenDistance  = 40,   -- studs: reopen when animatronic beyond (power save)
+    -- foxy
+    FoxyCheckInterval   = 5,    -- seconds between Pirate Cove peeks
+    FoxyCamPeekTime     = 0.35, -- how long the peek holds
+    -- loops
+    ScanRate            = 0.15, -- proximity scan tick
+    -- esp
+    EspColor            = Color3.fromRGB(255, 40, 40),
+    EspShowDistance     = true,
+    -- learning
+    PreferLearned       = true, -- replay learned fire over default
+}
+
+--===================== REMOTE / PATH TABLE =======================--
+-- resolved live so a missing node never hard-errors
+local function resolve(parent, ...)
+    local node = parent
+    for _, name in ipairs({...}) do
+        if not node then return nil end
+        node = node:FindFirstChild(name)
+    end
+    return node
+end
+
+local Remotes = {
+    leftDoor   = resolve(RS, "RemoteEvents", "OfficeControls", "leftDoorEvent"),
+    rightDoor  = resolve(RS, "RemoteEvents", "OfficeControls", "rightDoorEvent"),
+    leftLight  = resolve(RS, "RemoteEvents", "OfficeControls", "leftLightEvent"),
+    rightLight = resolve(RS, "RemoteEvents", "OfficeControls", "rightLightEvent"),
+    openClose  = resolve(RS, "RemoteEvents", "openCloseDoorEvent"),
+    switchCam  = resolve(RS, "RemoteEvents", "playerSwitchCamsEvent"),
+    openCams   = resolve(RS, "RemoteEvents", "openCamerasEvent"),
+    nightGuard = resolve(RS, "RemoteEvents", "triggerNightGuardModeEvent"),
+    camFlash   = resolve(RS, "RemoteEvents", "cameraFlashEvent"),
+    clickObj   = resolve(RS, "RemoteEvents", "playerUsedClickOnObjectEvent"),
+    updateTask = resolve(RS, "RemoteEvents", "updateTasksEvent"),
+    jammer     = resolve(RS, "RemoteEvents", "animatronicJammerEvent"),
+    finishGame = resolve(RS, "RemoteEvents", "finishGameEvent"),
+}
+
+-- office button parts (interactables) for click-fallback + proximity anchors
+local Office = {
+    LeftDoorBtn  = resolve(Workspace, "GameTriggers", "OfficeButtons", "LeftDoorButton"),
+    RightDoorBtn = resolve(Workspace, "GameTriggers", "OfficeButtons", "RightDoorButton"),
+    LeftLightBtn = resolve(Workspace, "GameTriggers", "OfficeButtons", "LeftLightButton"),
+    RightLightBtn= resolve(Workspace, "GameTriggers", "OfficeButtons", "RightLightButton"),
+    LeftDoor     = resolve(Workspace, "GameTriggers", "OfficeButtons", "LeftDoor"),
+    RightDoor    = resolve(Workspace, "GameTriggers", "OfficeButtons", "RightDoor"),
+}
+
+-- ClickDetectors for every control -> fireclickdetector triggers them
+-- directly on BOTH mobile and PC (no E, no tap needed).
+-- Primary = the on-screen button part; fallback = the door mesh / block.
+local ClickDets = {
+    leftDoor   = {
+        resolve(Workspace,"GameTriggers","OfficeButtons","LeftDoorButton","Part","ClickDetector"),
+        resolve(Workspace,"GameTriggers","OfficeButtons","LeftDoor","ClickDetector"),
+    },
+    rightDoor  = {
+        resolve(Workspace,"GameTriggers","OfficeButtons","RightDoorButton","Part","ClickDetector"),
+        resolve(Workspace,"GameTriggers","OfficeButtons","RightDoor","ClickDetector"),
+    },
+    leftLight  = {
+        resolve(Workspace,"GameTriggers","OfficeButtons","LeftLightButton","Part","ClickDetector"),
+        resolve(Workspace,"GameTriggers","OfficeButtons","LeftLight","BlockLight","ClickDetector"),
+    },
+    rightLight = {
+        resolve(Workspace,"GameTriggers","OfficeButtons","RightLightButton","Part","ClickDetector"),
+        resolve(Workspace,"GameTriggers","OfficeButtons","RightLight","BlockLight","ClickDetector"),
+    },
+}
+
+-- animatronics: model + which door side they attack from (FNAF1 logic)
+--   left  = West hall (Bonnie, Foxy)
+--   right = East hall (Chica, Freddy)
+local Animatronics = {
+    { name="Bonnie", model=resolve(Workspace,"Animatronics","Bonnie","BonnieNPC"), side="left"  },
+    { name="Chica",  model=resolve(Workspace,"Animatronics","Chica","ChicaNPC"),   side="right" },
+    { name="Freddy", model=resolve(Workspace,"Animatronics","Freddy","FreddyNPC"), side="right" },
+    { name="Foxy",   model=resolve(Workspace,"Animatronics","Foxy","FoxyNPC"),     side="left"  },
+    { name="GoldenFreddy", model=resolve(Workspace,"Animatronics","GoldenFreddy","GoldenFreddy"), side="none" },
+}
+
+-- FNAF1 camera IDs
+local CAM_LIST   = { "CAM1A","CAM1B","CAM1C","CAM2A","CAM2B","CAM3","CAM4A","CAM4B","CAM5","CAM6","CAM7" }
+local PIRATE_COVE = "CAM1C"   -- Foxy's cove
+
+--===================== SAFE FIRE HELPERS =========================--
+local function safeFire(remote, ...)
+    if not remote then return false end
+    local args = {...}
+    local ok = pcall(function() remote:FireServer(unpack(args)) end)
+    return ok
+end
+
+local function notify(title, text, dur)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", { Title = title, Text = text, Duration = dur or 4 })
+    end)
+end
+
+--===================== DOOR/LIGHT + LEARNING =====================--
+-- learned[remotePath] = { path=..., args={...} }
+local Learned = loadLearned()
+
+-- part->control map so we recognise clicks on office buttons
+local function controlKeyFromInstance(inst)
+    if inst == Office.LeftDoorBtn  or inst == Office.LeftDoor  then return "leftDoor"  end
+    if inst == Office.RightDoorBtn or inst == Office.RightDoor then return "rightDoor" end
+    if inst == Office.LeftLightBtn  then return "leftLight"  end
+    if inst == Office.RightLightBtn then return "rightLight" end
+    return nil
+end
+
+-- hook __namecall to LEARN the exact fire the game uses on E-press
+if hookmetamethod and getnamecallmethod and checkcaller then
+    local old
+    old = hookmetamethod(game, "__namecall", function(self, ...)
+        local method = getnamecallmethod()
+        if (method == "FireServer") and not checkcaller() then
+            local args = { ... }
+            -- direct OfficeControls events
+            for key, rem in pairs(Remotes) do
+                if self == rem and (key=="leftDoor" or key=="rightDoor" or key=="leftLight" or key=="rightLight") then
+                    Learned[key] = { kind="remote", key=key, args=args }
+                    saveLearned(Learned)
+                end
+            end
+            -- click-based control (playerUsedClickOnObjectEvent(button))
+            if self == Remotes.clickObj and typeof(args[1]) == "Instance" then
+                local ck = controlKeyFromInstance(args[1])
+                if ck then
+                    Learned[ck] = { kind="click", key=ck, target=args[1] }
+                    saveLearned(Learned)
+                end
+            end
+        end
+        return old(self, ...)
+    end)
+end
+
+-- toggle a control. Priority order, all input-free (mobile + PC):
+--   1) fireclickdetector on the control's ClickDetector  (works everywhere)
+--   2) learned replay (exact remote your tap used, if captured)
+--   3) direct OfficeControls remote fire
+--   4) playerUsedClickOnObjectEvent(button)
+local function toggleControl(key)
+    -- 1) ClickDetectors -- the mobile-proof path
+    if fireclickdetector then
+        for _, cd in ipairs(ClickDets[key] or {}) do
+            if cd then
+                local ok = pcall(fireclickdetector, cd)
+                if ok then return true end
+            end
+        end
+    end
+    -- 2) learned replay
+    local rec = Learned[key]
+    if Config.PreferLearned and rec then
+        if rec.kind == "remote" then
+            return safeFire(Remotes[key], unpack(rec.args or {}))
+        elseif rec.kind == "click" and rec.target then
+            return safeFire(Remotes.clickObj, rec.target)
+        end
+    end
+    -- 3) direct OfficeControls event (stateful toggle, no args)
+    if safeFire(Remotes[key]) then return true end
+    -- 4) generic click remote on the button part
+    local btn = ({
+        leftDoor=Office.LeftDoorBtn, rightDoor=Office.RightDoorBtn,
+        leftLight=Office.LeftLightBtn, rightLight=Office.RightLightBtn,
+    })[key]
+    if btn then return safeFire(Remotes.clickObj, btn) end
+    return false
+end
+
+-- track intended door state so we don't spam toggles
+local DoorState = { left=false, right=false }  -- false = open, true = closed
+local function setDoor(side, closed)
+    if DoorState[side] == closed then return end
+    toggleControl(side == "left" and "leftDoor" or "rightDoor")
+    DoorState[side] = closed
+end
+
+--===================== CAMERA HELPERS ============================--
+local monitorUp = false
+local function setMonitor(up)
+    if monitorUp == up then return end
+    safeFire(Remotes.nightGuard, up)
+    monitorUp = up
+end
+local function switchCam(id) safeFire(Remotes.switchCam, id) end
+local function flashCam() safeFire(Remotes.camFlash, true, 1) end
+
+-- peek Pirate Cove briefly to reset Foxy's meter
+local peeking = false
+local function checkFoxy()
+    if peeking then return end
+    peeking = true
+    task.spawn(function()
+        local wasUp = monitorUp
+        setMonitor(true)
+        task.wait(0.15)
+        switchCam(PIRATE_COVE)
+        task.wait(Config.FoxyCamPeekTime)
+        if not wasUp then setMonitor(false) end
+        peeking = false
+    end)
+end
+
+--===================== POSITION UTILS ============================--
+local function rootOf(model)
+    if not model then return nil end
+    return model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChildWhichIsA("BasePart")
+        or (model:IsA("BasePart") and model or nil)
+end
+
+local function myRoot()
+    local ch = LocalPlayer.Character
+    return ch and (ch:FindFirstChild("HumanoidRootPart") or ch:FindFirstChildWhichIsA("BasePart"))
+end
+
+local function anchorFor(side)
+    return side == "left" and Office.LeftDoorBtn or Office.RightDoorBtn
+end
+
+local function distToDoor(model, side)
+    local r = rootOf(model)
+    local a = anchorFor(side)
+    if not r or not a then return math.huge end
+    return (r.Position - a.Position).Magnitude
+end
+
+--===================== STATE FLAGS ===============================--
+local State = {
+    AutoDoor   = false,
+    AutoFoxy   = false,
+    AutoCam    = false,
+    AutoTask   = false,
+    ESP        = false,
+    AutoPlay   = false,
+    AutoAllNights = false,
+}
+
+--===================== ESP =======================================--
+local espObjects = {}
+local function clearESP()
+    for _, o in pairs(espObjects) do pcall(function() o:Destroy() end) end
+    espObjects = {}
+end
+
+local function buildESP()
+    clearESP()
+    for _, a in ipairs(Animatronics) do
+        if a.model and a.model.Parent then
+            local hl = Instance.new("Highlight")
+            hl.Name = "FNAF_ESP"
+            hl.FillColor = Config.EspColor
+            hl.OutlineColor = Color3.new(1,1,1)
+            hl.FillTransparency = 0.55
+            hl.OutlineTransparency = 0
+            hl.Adornee = a.model
+            hl.Parent = a.model
+            espObjects[#espObjects+1] = hl
+
+            local bb = Instance.new("BillboardGui")
+            bb.Name = "FNAF_ESP_TAG"
+            bb.Size = UDim2.fromOffset(190, 34)
+            bb.StudsOffset = Vector3.new(0, 3.2, 0)
+            bb.AlwaysOnTop = true
+            bb.Adornee = rootOf(a.model)
+            bb.Parent = a.model
+            local lbl = Instance.new("TextLabel")
+            lbl.BackgroundTransparency = 1
+            lbl.Size = UDim2.fromScale(1,1)
+            lbl.Font = Enum.Font.GothamBold
+            lbl.TextSize = 14
+            lbl.TextColor3 = Config.EspColor
+            lbl.TextStrokeTransparency = 0
+            lbl.Text = a.name
+            lbl.Parent = bb
+            espObjects[#espObjects+1] = bb
+            a._tag = lbl
+        end
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    if not State.ESP then return end
+    local mr = myRoot()
+    for _, a in ipairs(Animatronics) do
+        if a._tag and a.model and a.model.Parent then
+            if Config.EspShowDistance and mr then
+                local r = rootOf(a.model)
+                if r then
+                    a._tag.Text = ("%s  [%dm]"):format(a.name, math.floor((r.Position-mr.Position).Magnitude))
+                end
+            else
+                a._tag.Text = a.name
+            end
+        end
+    end
+end)
+
+--===================== AUTOMATION LOOPS ==========================--
+-- proximity auto-door: close the correct side when a threat is near
+task.spawn(function()
+    while true do
+        task.wait(Config.ScanRate)
+        if State.AutoDoor then
+            local nearL, nearR = false, false
+            for _, a in ipairs(Animatronics) do
+                if a.side == "left" or a.side == "right" then
+                    local d = distToDoor(a.model, a.side)
+                    if d <= Config.DoorTriggerDistance then
+                        if a.side == "left" then nearL = true else nearR = true end
+                    end
+                end
+            end
+            -- close on threat, reopen when clearly gone (power saving)
+            if nearL then setDoor("left", true)
+            elseif DoorState.left then
+                local minL = math.huge
+                for _, a in ipairs(Animatronics) do
+                    if a.side=="left" then minL = math.min(minL, distToDoor(a.model,"left")) end
+                end
+                if minL > Config.DoorReopenDistance then setDoor("left", false) end
+            end
+            if nearR then setDoor("right", true)
+            elseif DoorState.right then
+                local minR = math.huge
+                for _, a in ipairs(Animatronics) do
+                    if a.side=="right" then minR = math.min(minR, distToDoor(a.model,"right")) end
+                end
+                if minR > Config.DoorReopenDistance then setDoor("right", false) end
+            end
+        end
+    end
+end)
+
+-- auto-Foxy: timed Pirate Cove peek + emergency left-door slam
+task.spawn(function()
+    local last = 0
+    while true do
+        task.wait(0.2)
+        if State.AutoFoxy then
+            -- emergency: Foxy left the cove -> slam left door now
+            local foxy
+            for _, a in ipairs(Animatronics) do if a.name=="Foxy" then foxy=a end end
+            if foxy and foxy.model then
+                local d = distToDoor(foxy.model, "left")
+                if d <= (Config.DoorTriggerDistance + 12) then
+                    setDoor("left", true)
+                end
+            end
+            if tick() - last >= Config.FoxyCheckInterval then
+                last = tick()
+                checkFoxy()
+            end
+        end
+    end
+end)
+
+-- auto-cam: keep the monitor rotating to stall movement
+task.spawn(function()
+    local i = 1
+    while true do
+        task.wait(2)
+        if State.AutoCam then
+            setMonitor(true)
+            switchCam(CAM_LIST[i])
+            i = i % #CAM_LIST + 1
+        end
+    end
+end)
+
+-- auto-task: keep firing task completion if the game exposes it
+task.spawn(function()
+    while true do
+        task.wait(3)
+        if State.AutoTask and Remotes.updateTask then
+            safeFire(Remotes.updateTask)
+        end
+    end
+end)
+
+--===================== AUTO-PLAY NIGHT BOT =======================--
+-- Reads the clock text and manages doors/foxy/power until 6AM,
+-- then advances to the next night automatically.
+local function readNightHour()
+    -- TimeScreen shows current hour; parse "12 AM".."5 AM"
+    local lbl = resolve(Workspace,"GameTriggers","CameraScreen") -- may vary; scan for a TextLabel named 'time'
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name == "time" then
+            local h = tostring(d.Text):match("%d+")
+            if h then return tonumber(h) end
+        end
+    end
+    return nil
+end
+
+local autoPlayThread
+local function startAutoPlay(allNights)
+    if autoPlayThread then return end
+    State.AutoPlay = true
+    State.AutoDoor = true
+    State.AutoFoxy = true
+    notify("FNAF Hub", allNights and "Auto-playing ALL nights" or "Auto-playing current night", 5)
+    autoPlayThread = task.spawn(function()
+        while State.AutoPlay do
+            task.wait(1)
+            local hr = readNightHour()
+            -- keep monitor down by default so doors read correctly; foxy peeks handle cams
+            -- (door + foxy loops already run via their flags)
+            if hr == 6 then
+                notify("FNAF Hub", "Night cleared (6 AM)", 5)
+                -- open doors to reset, wait for next-night load
+                setDoor("left", false); setDoor("right", false)
+                task.wait(6)
+                if not allNights then break end
+                -- next night loads automatically; reset door state
+                DoorState.left, DoorState.right = false, false
+            end
+        end
+        State.AutoPlay = false
+        autoPlayThread = nil
+    end)
+end
+local function stopAutoPlay()
+    State.AutoPlay = false
+    State.AutoAllNights = false
+end
+
+--========================= FLUENT UI =============================--
+local Fluent = loadstring(game:HttpGet("https://github.com/dawid-scripts/Fluent/releases/latest/download/main.lua"))()
+local SaveManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/SaveManager.lua"))()
+local InterfaceManager = loadstring(game:HttpGet("https://raw.githubusercontent.com/dawid-scripts/Fluent/master/Addons/InterfaceManager.lua"))()
+
+local Window = Fluent:CreateWindow({
+    Title  = "FNAF 1 Hub",
+    SubTitle = "by Nyx  •  Delta",
+    TabWidth = 150,
+    Size = UDim2.fromOffset(600, 470),
+    Acrylic = true,
+    Theme = "Dark",
+    MinimizeKey = Enum.KeyCode.RightControl,
+})
+
+local Tabs = {
+    Automation = Window:AddTab({ Title = "Automation", Icon = "zap" }),
+    AutoPlay   = Window:AddTab({ Title = "Auto Play",  Icon = "gamepad-2" }),
+    Visuals    = Window:AddTab({ Title = "Visuals",    Icon = "eye" }),
+    Manual     = Window:AddTab({ Title = "Manual",     Icon = "sliders-horizontal" }),
+    Config     = Window:AddTab({ Title = "Config",     Icon = "settings" }),
+}
+
+--------------------------- AUTOMATION -----------------------------
+Tabs.Automation:AddParagraph({
+    Title = "Mobile + PC ready",
+    Content = "Doors & lights fire via their ClickDetectors, so no E-press or tap needed anywhere. Just flip the toggles below.",
+})
+
+Tabs.Automation:AddToggle("AutoDoor", {
+    Title = "Auto Door (proximity)",
+    Description = "Slams the correct door when an animatronic gets close, reopens to save power.",
+    Default = false,
+}):OnChanged(function(v) State.AutoDoor = v end)
+
+Tabs.Automation:AddToggle("AutoFoxy", {
+    Title = "Auto Foxy Check",
+    Description = "Peeks Pirate Cove (CAM1C) on a timer to reset Foxy, slams left door if he runs.",
+    Default = false,
+}):OnChanged(function(v) State.AutoFoxy = v end)
+
+Tabs.Automation:AddToggle("AutoCam", {
+    Title = "Auto Cam Cycle",
+    Description = "Rotates through all cameras to stall animatronic movement.",
+    Default = false,
+}):OnChanged(function(v) State.AutoCam = v end)
+
+Tabs.Automation:AddToggle("AutoTask", {
+    Title = "Auto Task",
+    Description = "Fires updateTasksEvent to auto-complete night tasks if present.",
+    Default = false,
+}):OnChanged(function(v) State.AutoTask = v end)
+
+Tabs.Automation:AddButton({
+    Title = "Close BOTH doors now",
+    Callback = function() setDoor("left", true); setDoor("right", true) end,
+})
+Tabs.Automation:AddButton({
+    Title = "Open BOTH doors now",
+    Callback = function() setDoor("left", false); setDoor("right", false) end,
+})
+
+--------------------------- AUTO PLAY ------------------------------
+Tabs.AutoPlay:AddParagraph({
+    Title = "Full Night Bot",
+    Content = "Plays the night for you: manages both doors off animatronic positions, keeps Foxy in check, survives to 6 AM.",
+})
+Tabs.AutoPlay:AddButton({
+    Title = "Auto-Play Current Night",
+    Callback = function() startAutoPlay(false) end,
+})
+Tabs.AutoPlay:AddButton({
+    Title = "Auto-Play ALL Nights (1-6)",
+    Callback = function() State.AutoAllNights = true; startAutoPlay(true) end,
+})
+Tabs.AutoPlay:AddButton({
+    Title = "STOP Auto-Play",
+    Callback = function() stopAutoPlay(); notify("FNAF Hub","Auto-play stopped",3) end,
+})
+Tabs.AutoPlay:AddToggle("GreedyFoxy", {
+    Title = "Greedy Foxy (aggressive peeks)",
+    Description = "Halves the Foxy check interval for very active servers.",
+    Default = false,
+}):OnChanged(function(v)
+    Config.FoxyCheckInterval = v and 2.5 or 5
+end)
+
+--------------------------- VISUALS --------------------------------
+Tabs.Visuals:AddToggle("ESP", {
+    Title = "Animatronic ESP",
+    Description = "Highlight + name + live distance on every animatronic.",
+    Default = false,
+}):OnChanged(function(v)
+    State.ESP = v
+    if v then buildESP() else clearESP() end
+end)
+Tabs.Visuals:AddToggle("ESPDist", {
+    Title = "Show Distance",
+    Default = true,
+}):OnChanged(function(v) Config.EspShowDistance = v end)
+Tabs.Visuals:AddColorpicker("ESPColor", {
+    Title = "ESP Color",
+    Default = Config.EspColor,
+    Callback = function(c)
+        Config.EspColor = c
+        if State.ESP then buildESP() end
+    end,
+})
+Tabs.Visuals:AddButton({
+    Title = "Rebuild ESP",
+    Callback = function() if State.ESP then buildESP() end end,
+})
+
+--------------------------- MANUAL ---------------------------------
+Tabs.Manual:AddSection("Doors & Lights")
+Tabs.Manual:AddButton({ Title="Toggle Left Door",  Callback=function() toggleControl("leftDoor")  end })
+Tabs.Manual:AddButton({ Title="Toggle Right Door", Callback=function() toggleControl("rightDoor") end })
+Tabs.Manual:AddButton({ Title="Toggle Left Light", Callback=function() toggleControl("leftLight") end })
+Tabs.Manual:AddButton({ Title="Toggle Right Light",Callback=function() toggleControl("rightLight")end })
+
+Tabs.Manual:AddSection("Cameras")
+Tabs.Manual:AddDropdown("CamPick", {
+    Title = "Switch Camera",
+    Values = CAM_LIST,
+    Multi = false,
+    Default = 1,
+    Callback = function(id) setMonitor(true); switchCam(id) end,
+})
+Tabs.Manual:AddButton({ Title="Open Monitor",  Callback=function() setMonitor(true)  end })
+Tabs.Manual:AddButton({ Title="Close Monitor", Callback=function() setMonitor(false) end })
+Tabs.Manual:AddButton({ Title="Camera Flash",  Callback=function() flashCam() end })
+Tabs.Manual:AddButton({ Title="Peek Pirate Cove (Foxy)", Callback=function() checkFoxy() end })
+
+--------------------------- CONFIG ---------------------------------
+Tabs.Config:AddSlider("TrigDist", {
+    Title = "Door Trigger Distance",
+    Description = "How close (studs) before auto-door slams.",
+    Default = Config.DoorTriggerDistance, Min = 8, Max = 80, Rounding = 0,
+    Callback = function(v) Config.DoorTriggerDistance = v end,
+})
+Tabs.Config:AddSlider("ReopenDist", {
+    Title = "Door Reopen Distance",
+    Default = Config.DoorReopenDistance, Min = 10, Max = 120, Rounding = 0,
+    Callback = function(v) Config.DoorReopenDistance = v end,
+})
+Tabs.Config:AddSlider("FoxyInt", {
+    Title = "Foxy Check Interval (s)",
+    Default = Config.FoxyCheckInterval, Min = 1, Max = 15, Rounding = 1,
+    Callback = function(v) Config.FoxyCheckInterval = v end,
+})
+Tabs.Config:AddSlider("ScanRate", {
+    Title = "Proximity Scan Rate (s)",
+    Default = Config.ScanRate, Min = 0.05, Max = 1, Rounding = 2,
+    Callback = function(v) Config.ScanRate = v end,
+})
+Tabs.Config:AddToggle("PreferLearned", {
+    Title = "Prefer Learned Toggles",
+    Description = "Replay the exact remote your E-press used.",
+    Default = true,
+}):OnChanged(function(v) Config.PreferLearned = v end)
+Tabs.Config:AddButton({
+    Title = "Wipe Learned Data",
+    Callback = function()
+        Learned = {}; saveLearned(Learned)
+        notify("FNAF Hub","Learned toggles wiped",3)
+    end,
+})
+
+--========================= SAVE MANAGER ==========================--
+SaveManager:SetLibrary(Fluent)
+InterfaceManager:SetLibrary(Fluent)
+SaveManager:IgnoreThemeSettings()
+SaveManager:SetIgnoreIndexes({})
+InterfaceManager:SetFolder("FNAF_Hub")
+SaveManager:SetFolder("FNAF_Hub/configs")
+InterfaceManager:BuildInterfaceSection(Tabs.Config)
+SaveManager:BuildConfigSection(Tabs.Config)
+
+Window:SelectTab(1)
+
+Fluent:Notify({
+    Title = "FNAF 1 Hub loaded",
+    Content = "Mobile-ready. Just flip Auto Door + Auto Foxy -- no tapping needed.",
+    Duration = 8,
+})
+
+SaveManager:LoadAutoloadConfig()
