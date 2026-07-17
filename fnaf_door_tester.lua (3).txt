@@ -1,0 +1,114 @@
+--[[
+    ================================================================
+      FNAF DOOR TESTER v4  ::  Delta   (WindUI-based)
+    ----------------------------------------------------------------
+      Uses WindUI (same UI as the hub, proven to render for you).
+      A window opens with a Target toggle + 10 method buttons.
+
+      HOW:
+        1. Run it -> "DOOR TESTER" window opens.
+        2. Pick target side (Left/Right) up top.
+        3. Tap each "Method N" button, watch that door.
+        4. When the door moves -> tell Nyx that number. Done.
+    ================================================================
+]]
+local RS        = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+
+local function R(p,...) local n=p for _,x in ipairs({...}) do if not n then return end n=n:FindFirstChild(x) end return n end
+local function fire(rem,...) if rem then pcall(function() rem:FireServer(...) end) end end
+local function fcd(cd) if cd and fireclickdetector then pcall(fireclickdetector, cd, 50) end end
+
+local clickObj   = R(RS,"RemoteEvents","playerUsedClickOnObjectEvent")
+local leftDoorEv = R(RS,"RemoteEvents","OfficeControls","leftDoorEvent")
+local rightDoorEv= R(RS,"RemoteEvents","OfficeControls","rightDoorEvent")
+local openClose  = R(RS,"RemoteEvents","openCloseDoorEvent")
+
+local T = {
+    left = {
+        btnPart=R(Workspace,"GameTriggers","OfficeButtons","LeftDoorButton","Part"),
+        door   =R(Workspace,"GameTriggers","OfficeButtons","LeftDoor"),
+        btn    =R(Workspace,"GameTriggers","OfficeButtons","LeftDoorButton"),
+        cdPart =R(Workspace,"GameTriggers","OfficeButtons","LeftDoorButton","Part","ClickDetector"),
+        cdDoor =R(Workspace,"GameTriggers","OfficeButtons","LeftDoor","ClickDetector"),
+        ev=leftDoorEv,
+    },
+    right = {
+        btnPart=R(Workspace,"GameTriggers","OfficeButtons","RightDoorButton","Part"),
+        door   =R(Workspace,"GameTriggers","OfficeButtons","RightDoor"),
+        btn    =R(Workspace,"GameTriggers","OfficeButtons","RightDoorButton"),
+        cdPart =R(Workspace,"GameTriggers","OfficeButtons","RightDoorButton","Part","ClickDetector"),
+        cdDoor =R(Workspace,"GameTriggers","OfficeButtons","RightDoor","ClickDetector"),
+        ev=rightDoorEv,
+    },
+}
+
+local side = "left"
+-- method n fires the nth candidate for the CURRENT side
+local function runMethod(n)
+    local t = T[side]
+    if     n==1 then fire(clickObj, t.btnPart)
+    elseif n==2 then fire(clickObj, t.door)
+    elseif n==3 then fire(clickObj, t.btn)
+    elseif n==4 then fcd(t.cdPart)
+    elseif n==5 then fcd(t.cdDoor)
+    elseif n==6 then fire(t.ev)
+    elseif n==7 then fire(t.ev, true)
+    elseif n==8 then fire(openClose, side)
+    elseif n==9 then fire(openClose, true)
+    elseif n==10 then fire(openClose, side, true)
+    end
+end
+
+local DESC = {
+    "clickObj(button.Part)",
+    "clickObj(Door mesh)",
+    "clickObj(Button model)",
+    "fireclickdetector(button Part CD)",
+    "fireclickdetector(Door CD)",
+    "<side>DoorEvent()  no args",
+    "<side>DoorEvent(true)",
+    "openCloseDoorEvent('<side>')",
+    "openCloseDoorEvent(true)",
+    "openCloseDoorEvent('<side>', true)",
+}
+
+--============================ WINDUI ============================--
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+
+local Window = WindUI:CreateWindow({
+    Title  = "DOOR TESTER",
+    Icon   = "wrench",
+    Author = "by Nyx",
+    Folder = "FNAF_Hub",
+    Size   = UDim2.fromOffset(480, 430),
+    Transparent = true,
+    Theme  = "Dark",
+    SideBarWidth = 130,
+    Resizable = true,
+})
+
+local Tab = Window:Tab({ Title = "Test", Icon = "door-open" })
+
+Tab:Paragraph({
+    Title = "Instructions",
+    Desc  = "Pick the target door, then tap each Method button and watch that door. When it moves, tell Nyx the number.",
+})
+
+Tab:Dropdown({
+    Title = "Target Door",
+    Values = { "left", "right" },
+    Value = "left",
+    Multi = false,
+    Callback = function(v) side = v end,
+})
+
+Tab:Section({ Title = "Methods" })
+for i = 1, 10 do
+    Tab:Button({
+        Title = ("Method %d  —  %s"):format(i, DESC[i]),
+        Callback = function() runMethod(i) end,
+    })
+end
+
+WindUI:Notify({ Title="Door Tester", Content="Tap each Method, watch the door. Report the working number.", Duration=6, Icon="wrench" })
