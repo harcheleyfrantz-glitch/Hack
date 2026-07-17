@@ -1,0 +1,469 @@
+--[[
+    ==================================================================
+      FNAF 1  ::  AUTO BEATER  v2   (Delta Mobile / Rayfield)
+      PlaceId 12497348201   •   rebuilt from full live dumps
+    ------------------------------------------------------------------
+      WHAT CHANGED (why it works now):
+        • Doors are pressed with fireproximityprompt on the real
+          OfficeButtons.*DoorButton.Part.ProximityPrompt
+          (+ ClickDetector + door-mesh ClickDetector fallbacks).
+        • Door OPEN/CLOSED is READ from the sliding door mesh Y
+          (self-calibrating) instead of guessed.
+        • Distances anchor to FIXED door-button parts, not the
+          moving door mesh, so proximity logic stays correct.
+        • 6 AM win is read from the office SurfaceGui 'time' label.
+        • Foxy is handled by watching FoxyNPC leave Pirate Cove.
+      Bonnie/Foxy = LEFT.  Chica/Freddy = RIGHT.
+    ==================================================================
+]]
+
+local Players    = game:GetService("Players")
+local RS         = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local Workspace  = game:GetService("Workspace")
+local Http       = game:GetService("HttpService")
+local LP         = Players.LocalPlayer
+
+--========================== SAFE RESOLVE ==========================--
+-- Non-yielding deep resolver: parent, "a","b","c" -> instance or nil
+local function R(p, ...)
+    local n = p
+    for _, x in ipairs({...}) do
+        if not n then return nil end
+        n = n:FindFirstChild(x)
+    end
+    return n
+end
+-- Retrying resolver (handles streaming / late load on mobile)
+local function Rw(timeout, p, ...)
+    local path = {...}
+    local t0 = os.clock()
+    repeat
+        local n = R(p, table.unpack(path))
+        if n then return n end
+        RunService.Heartbeat:Wait()
+    until os.clock() - t0 > (timeout or 5)
+    return R(p, table.unpack(path))
+end
+
+--========================== EXECUTOR SHIMS ========================--
+local FPP = fireproximityprompt or (firetouchinterest and nil)   -- Delta has fireproximityprompt
+local FCD = fireclickdetector
+local function fire(rem, ...) if rem then return (pcall(function() rem:FireServer(...) end)) end return false end
+local function firePrompt(pr) if pr and FPP then return (pcall(FPP, pr)) end return false end
+local function fireCD(cd) if cd and FCD then return (pcall(FCD, cd, 50)) end return false end
+
+--========================== REMOTES ==============================--
+local RE = R(RS, "RemoteEvents")
+local Remotes = {
+    switchCam   = R(RE, "playerSwitchCamsEvent"),
+    openCams    = R(RE, "openCamerasEvent"),
+    camFlash    = R(RE, "cameraFlashEvent"),
+    leftDoor    = R(RE, "OfficeControls", "leftDoorEvent"),
+    rightDoor   = R(RE, "OfficeControls", "rightDoorEvent"),
+    leftLight   = R(RE, "OfficeControls", "leftLightEvent"),
+    rightLight  = R(RE, "OfficeControls", "rightLightEvent"),
+    openClose   = R(RE, "openCloseDoorEvent"),
+    clickObj    = R(RE, "playerUsedClickOnObjectEvent"),
+    updateTask  = R(RE, "updateTasksEvent"),
+    nightGuard  = R(RE, "triggerNightGuardModeEvent"),
+    -- experimental (exist in dump, args unknown)
+    changeAI    = R(RE, "playerChangeAI"),
+    freeze      = R(RE, "freezeMovements"),
+    jammer      = R(RE, "animatronicJammerEvent"),
+    finishGame  = R(RE, "finishGameEvent"),
+}
+
+--========================== OFFICE PARTS =========================--
+local OB = Rw(8, Workspace, "GameTriggers", "OfficeButtons")
+
+local function partOf(m) if m then return m:FindFirstChildWhichIsA("BasePart") or (m:IsA("BasePart") and m) end end
+
+local Side = {
+    left = {
+        doorMesh  = R(OB, "LeftDoor"),                    -- sliding door (moves)
+        doorCD    = R(OB, "LeftDoor", "ClickDetector"),
+        btnPart   = R(OB, "LeftDoorButton", "Part"),      -- FIXED button
+        btnPrompt = R(OB, "LeftDoorButton", "Part", "ProximityPrompt"),
+        btnCD     = R(OB, "LeftDoorButton", "Part", "ClickDetector"),
+        lightPart = R(OB, "LeftLightButton", "Part"),
+        lightPr   = R(OB, "LeftLightButton", "Part", "ProximityPrompt"),
+        lightCD   = R(OB, "LeftLightButton", "Part", "ClickDetector"),
+        doorEv    = Remotes.leftDoor,  lightEv = Remotes.leftLight,
+    },
+    right = {
+        doorMesh  = R(OB, "RightDoor"),
+        doorCD    = R(OB, "RightDoor", "ClickDetector"),
+        btnPart   = R(OB, "RightDoorButton", "Part"),
+        btnPrompt = R(OB, "RightDoorButton", "Part", "ProximityPrompt"),
+        btnCD     = R(OB, "RightDoorButton", "Part", "ClickDetector"),
+        lightPart = R(OB, "RightLightButton", "Part"),
+        lightPr   = R(OB, "RightLightButton", "Part", "ProximityPrompt"),
+        lightCD   = R(OB, "RightLightButton", "Part", "ClickDetector"),
+        doorEv    = Remotes.rightDoor, lightEv = Remotes.rightLight,
+    },
+}
+
+-- FIXED distance anchor per side (button part never moves; door mesh does)
+local anchorPos = {}
+for s, d in pairs(Side) do
+    local a = d.btnPart or d.lightPart or d.doorMesh
+    anchorPos[s] = a and a.Position
+end
+
+--========================== ANIMATRONICS =========================--
+local ANI = Rw(8, Workspace, "Animatronics")
+local Animatronics = {
+    { name="Bonnie", model=R(ANI,"Bonnie","BonnieNPC"),           side="left"  },
+    { name="Chica",  model=R(ANI,"Chica","ChicaNPC"),             side="right" },
+    { name="Freddy", model=R(ANI,"Freddy","FreddyNPC"),           side="right" },
+    { name="Foxy",   model=R(ANI,"Foxy","FoxyNPC"),               side="left"  },
+    { name="GoldenFreddy", model=R(ANI,"GoldenFreddy","GoldenFreddy"), side="none" },
+}
+local function rootOf(m)
+    if not m then return nil end
+    return m:FindFirstChild("HumanoidRootPart") or m:FindFirstChildWhichIsA("BasePart") or (m:IsA("BasePart") and m or nil)
+end
+local function myRoot()
+    local c = LP.Character
+    return c and (c:FindFirstChild("HumanoidRootPart") or c:FindFirstChildWhichIsA("BasePart"))
+end
+
+-- Foxy cove origin (to detect when he starts running)
+local foxyModel; for _,a in ipairs(Animatronics) do if a.name=="Foxy" then foxyModel=a.model end end
+local foxyOrigin = foxyModel and rootOf(foxyModel) and rootOf(foxyModel).Position
+
+local CAM_LIST    = { "CAM1A","CAM1B","CAM1C","CAM2A","CAM2B","CAM3","CAM4A","CAM4B","CAM5","CAM6","CAM7" }
+local PIRATE_COVE = "CAM1C"
+
+--========================== CONFIG / STATE =======================--
+local Cfg = { trigger=38, reopen=55, foxyRun=45, foxyInt=6, scan=0.15,
+              espColor=Color3.fromRGB(255,45,45), espDist=true }
+local S = { autoDoor=false, autoFoxy=false, autoCam=false, autoTask=false, esp=false, beat=false }
+
+--========================== DOOR CONTROL =========================--
+-- Self-calibrating open reference: door slides DOWN to close, so OPEN = highest Y seen.
+local openY = {}
+local function calib(side)
+    local dm = Side[side].doorMesh; if not dm then return end
+    local y = dm.Position.Y
+    if not openY[side] or y > openY[side] then openY[side] = y end
+end
+local function isClosed(side)
+    local dm = Side[side].doorMesh
+    if not dm or not openY[side] then return false end
+    return (openY[side] - dm.Position.Y) > 2      -- dropped => closed
+end
+-- Physically press the door button (all methods, whichever the game honors)
+local function pressDoor(side)
+    local d = Side[side]
+    firePrompt(d.btnPrompt)
+    fireCD(d.btnCD)
+    fireCD(d.doorCD)
+    fire(d.doorEv)                       -- remote fallback (no-arg)
+    if Remotes.clickObj then fire(Remotes.clickObj, d.btnPart) end
+end
+-- Toggle then verify it actually moved; retry a couple times.
+local function toggleDoor(side)
+    local dm = Side[side].doorMesh; if not dm then return false end
+    calib(side)
+    local before = dm.Position.Y
+    for _=1,3 do
+        pressDoor(side)
+        local t0=os.clock()
+        repeat RunService.Heartbeat:Wait() until os.clock()-t0>0.35
+        if math.abs(dm.Position.Y - before) > 1 then calib(side); return true end
+    end
+    return false
+end
+local function setDoor(side, wantClosed)
+    calib(side)
+    if isClosed(side) == wantClosed then return end
+    toggleDoor(side)
+end
+local function pressLight(side)
+    local d = Side[side]
+    firePrompt(d.lightPr); fireCD(d.lightCD); fire(d.lightEv)
+    if Remotes.clickObj then fire(Remotes.clickObj, d.lightPart) end
+end
+
+--========================== CAMERA ===============================--
+local monitorUp, lastCam = false, "CAM1A"
+local function switchCam(id)
+    fire(Remotes.switchCam, id)
+    if id == "" then monitorUp=false else monitorUp=true; lastCam=id end
+end
+local function closeMonitor() switchCam("") end
+local function flashCam() fire(Remotes.camFlash, true, 1) end
+local peeking=false
+local function peekFoxy()
+    if peeking then return end
+    peeking=true
+    task.spawn(function()
+        local wasUp = monitorUp
+        switchCam(PIRATE_COVE); task.wait(0.35)
+        if not wasUp then closeMonitor() end
+        peeking=false
+    end)
+end
+
+--========================== DISTANCES ============================--
+local function distToDoor(model, side)
+    local r = rootOf(model); local a = anchorPos[side]
+    if not r or not a then return math.huge end
+    return (r.Position - a).Magnitude
+end
+local function foxyOut()
+    if not foxyModel or not foxyOrigin then return false end
+    local r = rootOf(foxyModel); if not r then return false end
+    return (r.Position - foxyOrigin).Magnitude > Cfg.foxyRun     -- left the cove = running
+end
+
+--========================== ESP ==================================--
+local espO={}
+local function clearESP() for _,o in pairs(espO) do pcall(function() o:Destroy() end) end espO={} end
+local function buildESP()
+    clearESP()
+    for _,a in ipairs(Animatronics) do
+        if a.model and a.model.Parent then
+            local hl=Instance.new("Highlight")
+            hl.FillColor=Cfg.espColor; hl.OutlineColor=Color3.new(1,1,1)
+            hl.FillTransparency=0.55; hl.Adornee=a.model; hl.Parent=a.model
+            espO[#espO+1]=hl
+            local host=rootOf(a.model)
+            if host then
+                local bb=Instance.new("BillboardGui")
+                bb.Size=UDim2.fromOffset(190,34); bb.StudsOffset=Vector3.new(0,3.2,0)
+                bb.AlwaysOnTop=true; bb.Adornee=host; bb.Parent=host
+                local t=Instance.new("TextLabel")
+                t.BackgroundTransparency=1; t.Size=UDim2.fromScale(1,1)
+                t.Font=Enum.Font.GothamBold; t.TextSize=14; t.TextColor3=Cfg.espColor
+                t.TextStrokeTransparency=0; t.Text=a.name; t.Parent=bb
+                espO[#espO+1]=bb; a._tag=t
+            end
+        end
+    end
+end
+RunService.RenderStepped:Connect(function()
+    if not S.esp then return end
+    local mr=myRoot()
+    for _,a in ipairs(Animatronics) do
+        if a._tag and a.model and a.model.Parent then
+            local r=rootOf(a.model)
+            if Cfg.espDist and mr and r then
+                a._tag.Text=("%s [%dm]"):format(a.name, math.floor((r.Position-mr.Position).Magnitude))
+            else a._tag.Text=a.name end
+        end
+    end
+end)
+
+--==================== CORE DEFENSE LOGIC =========================--
+local function defendTick()
+    for _, side in ipairs({"left","right"}) do
+        local near=false
+        for _,a in ipairs(Animatronics) do
+            if a.side==side and a.name~="Foxy" and a.model then
+                if distToDoor(a.model, side) <= Cfg.trigger then near=true break end
+            end
+        end
+        if near then
+            setDoor(side, true)
+        elseif isClosed(side) then
+            -- reopen to save power once everyone is far
+            local mn=math.huge
+            for _,a in ipairs(Animatronics) do
+                if a.side==side and a.name~="Foxy" and a.model then
+                    mn=math.min(mn, distToDoor(a.model, side))
+                end
+            end
+            -- keep shut if Foxy is out and this is the left door
+            if side=="left" and foxyOut() then mn=0 end
+            if mn > Cfg.reopen then setDoor(side, false) end
+        end
+    end
+end
+
+-- door / defense loop
+task.spawn(function()
+    while true do
+        task.wait(Cfg.scan)
+        if S.autoDoor or S.beat then pcall(defendTick) end
+    end
+end)
+-- Foxy loop: slam left when he runs, periodic cove peek to reset him
+task.spawn(function()
+    local last=0
+    while true do
+        task.wait(0.2)
+        if S.autoFoxy or S.beat then
+            if foxyOut() then setDoor("left", true) end
+            if tick()-last >= Cfg.foxyInt then last=tick(); pcall(peekFoxy) end
+        end
+    end
+end)
+-- optional cam cycle
+task.spawn(function()
+    local i=1
+    while true do
+        task.wait(2)
+        if S.autoCam then switchCam(CAM_LIST[i]); i=i%#CAM_LIST+1 end
+    end
+end)
+-- optional task tick
+task.spawn(function()
+    while true do
+        task.wait(3)
+        if (S.autoTask or S.beat) and Remotes.updateTask then fire(Remotes.updateTask) end
+    end
+end)
+
+--==================== NIGHT CLOCK / WIN ==========================--
+-- Reads the office SurfaceGui 'time' label (e.g. "5 AM" / "6 AM").
+local function readTimeLabel()
+    for _,d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name=="time" then
+            local txt = tostring(d.Text)
+            local h = txt:match("(%d+)")
+            if h then return tonumber(h), txt end
+        end
+    end
+    return nil
+end
+local function readNight()
+    for _,d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name=="night" then
+            local n = tostring(d.Text):match("(%d+)")
+            if n then return tonumber(n) end
+        end
+    end
+end
+local function readPower()
+    for _,d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name=="percentage" then
+            local p = tostring(d.Text):match("(%d+)")
+            if p then return tonumber(p) end
+        end
+    end
+end
+
+local beatThread
+local function startBeat(all, note)
+    if beatThread then if note then note("Already running") end return end
+    S.beat=true
+    if note then note(all and "Beating ALL nights (1-6)…" or "Beating current night…") end
+    beatThread=task.spawn(function()
+        local clearedNights={}
+        while S.beat do
+            task.wait(1)
+            local hr = readTimeLabel()
+            local nite = readNight()
+            if hr==6 then
+                local key = nite or 1
+                if not clearedNights[key] then
+                    clearedNights[key]=true
+                    if note then note(("Night %s cleared — 6 AM"):format(tostring(nite or "?"))) end
+                    -- open both to relax; next night resets clock automatically
+                    pcall(setDoor,"left",false); pcall(setDoor,"right",false)
+                    if not all then break end
+                    task.wait(8)   -- ride the 6AM cutscene into the next night
+                end
+            end
+        end
+        S.beat=false; beatThread=nil
+    end)
+end
+local function stopBeat() S.beat=false end
+
+--========================== RAYFIELD =============================--
+local ok, Rayfield = pcall(function()
+    return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+end)
+if not ok or not Rayfield then
+    warn("[FNAF Hub] Rayfield failed to load: "..tostring(Rayfield))
+    return
+end
+
+local Window = Rayfield:CreateWindow({
+    Name = "FNAF 1 Auto Beater v2",
+    LoadingTitle = "FNAF Hub",
+    LoadingSubtitle = "by Nyx",
+    ConfigurationSaving = { Enabled = false },
+    KeySystem = false,
+})
+local function toast(m) pcall(function() Rayfield:Notify({ Title="Auto Beater", Content=m, Duration=5 }) end) end
+
+local TB = Window:CreateTab("Auto Beater", 4483362458)
+local TA = Window:CreateTab("Automation", 4483362458)
+local TV = Window:CreateTab("Visuals", 4483362458)
+local TM = Window:CreateTab("Manual", 4483362458)
+local TP = Window:CreateTab("Power", 4483362458)
+local TC = Window:CreateTab("Config", 4483362458)
+
+----------------------------- BEATER -------------------------------
+TB:CreateParagraph({ Title="How it works", Content=
+"Presses the real door buttons (proximity prompt), reads each door's true open/closed state, and closes/opens by animatronic distance to save power. Handles Foxy runs and detects 6 AM automatically. Just press MASTER, then BEAT."})
+TB:CreateToggle({ Name="MASTER: Enable Everything", CurrentValue=false, Flag="master", Callback=function(v)
+    S.autoDoor=v; S.autoFoxy=v; S.autoTask=v; S.esp=v
+    if v then buildESP() else clearESP() end
+    toast(v and "All automations ON" or "All automations OFF")
+end })
+TB:CreateButton({ Name="BEAT CURRENT NIGHT", Callback=function() S.autoDoor=true; S.autoFoxy=true; startBeat(false,toast) end })
+TB:CreateButton({ Name="BEAT ALL NIGHTS (1-6)", Callback=function() S.autoDoor=true; S.autoFoxy=true; startBeat(true,toast) end })
+TB:CreateButton({ Name="STOP", Callback=function() stopBeat(); toast("Stopped") end })
+TB:CreateButton({ Name="Status", Callback=function()
+    local hr,txt=readTimeLabel()
+    toast(("Night %s | Time %s | Power %s%% | L:%s R:%s"):format(
+        tostring(readNight() or "?"), tostring(txt or "?"), tostring(readPower() or "?"),
+        isClosed("left") and "shut" or "open", isClosed("right") and "shut" or "open"))
+end })
+
+----------------------------- AUTOMATION ---------------------------
+TA:CreateToggle({ Name="Auto Door (proximity)", CurrentValue=false, Flag="ad", Callback=function(v) S.autoDoor=v end })
+TA:CreateToggle({ Name="Auto Foxy Defense",     CurrentValue=false, Flag="af", Callback=function(v) S.autoFoxy=v end })
+TA:CreateToggle({ Name="Auto Cam Cycle",        CurrentValue=false, Flag="ac", Callback=function(v) S.autoCam=v end })
+TA:CreateToggle({ Name="Auto Task",             CurrentValue=false, Flag="at", Callback=function(v) S.autoTask=v end })
+TA:CreateButton({ Name="Close BOTH doors", Callback=function() setDoor("left",true); setDoor("right",true) end })
+TA:CreateButton({ Name="Open BOTH doors",  Callback=function() setDoor("left",false); setDoor("right",false) end })
+
+----------------------------- VISUALS ------------------------------
+TV:CreateToggle({ Name="Animatronic ESP", CurrentValue=false, Flag="esp", Callback=function(v) S.esp=v; if v then buildESP() else clearESP() end end })
+TV:CreateToggle({ Name="Show Distance", CurrentValue=true, Flag="espd", Callback=function(v) Cfg.espDist=v end })
+TV:CreateColorPicker({ Name="ESP Color", Color=Cfg.espColor, Flag="espc", Callback=function(c) Cfg.espColor=c; if S.esp then buildESP() end end })
+TV:CreateButton({ Name="Rebuild ESP", Callback=function() if S.esp then buildESP() end end })
+
+----------------------------- MANUAL -------------------------------
+TM:CreateSection("Doors & Lights")
+TM:CreateButton({ Name="Toggle Left Door",  Callback=function() toggleDoor("left")  end })
+TM:CreateButton({ Name="Toggle Right Door", Callback=function() toggleDoor("right") end })
+TM:CreateButton({ Name="Left Light",  Callback=function() pressLight("left")  end })
+TM:CreateButton({ Name="Right Light", Callback=function() pressLight("right") end })
+TM:CreateSection("Cameras")
+TM:CreateDropdown({ Name="Switch Camera", Options=CAM_LIST, CurrentOption={"CAM1A"}, MultipleOptions=false, Flag="cam",
+    Callback=function(opt) local id=type(opt)=="table" and opt[1] or opt; switchCam(id) end })
+TM:CreateButton({ Name="Close Monitor", Callback=function() closeMonitor() end })
+TM:CreateButton({ Name="Camera Flash",  Callback=function() flashCam() end })
+TM:CreateButton({ Name="Peek Pirate Cove (Foxy)", Callback=function() peekFoxy() end })
+
+----------------------------- POWER --------------------------------
+TP:CreateParagraph({ Title="Experimental", Content=
+"These remotes exist in the game but their real args weren't captured. One of them may disable/freeze animatronics. Harmless to try — if a night stops fighting back, leave it on."})
+TP:CreateButton({ Name="freezeMovements(true)",      Callback=function() fire(Remotes.freeze,true); toast("freeze true") end })
+TP:CreateButton({ Name="animatronicJammer(true)",    Callback=function() fire(Remotes.jammer,true); toast("jammer true") end })
+TP:CreateButton({ Name="playerChangeAI(0)",          Callback=function() fire(Remotes.changeAI,0); toast("changeAI 0") end })
+TP:CreateButton({ Name="triggerNightGuardMode(true)",Callback=function() fire(Remotes.nightGuard,true); toast("nightGuard true") end })
+TP:CreateButton({ Name="finishGame()  [try win]",    Callback=function() fire(Remotes.finishGame); toast("finishGame fired") end })
+
+----------------------------- CONFIG -------------------------------
+TC:CreateSlider({ Name="Door Trigger Distance", Range={8,120}, Increment=1, CurrentValue=Cfg.trigger, Flag="td", Callback=function(v) Cfg.trigger=v end })
+TC:CreateSlider({ Name="Door Reopen Distance",  Range={10,160}, Increment=1, CurrentValue=Cfg.reopen, Flag="rd", Callback=function(v) Cfg.reopen=v end })
+TC:CreateSlider({ Name="Foxy Run Distance",     Range={10,120}, Increment=1, CurrentValue=Cfg.foxyRun, Flag="fr", Callback=function(v) Cfg.foxyRun=v end })
+TC:CreateSlider({ Name="Foxy Peek Interval (s)",Range={2,20}, Increment=1, CurrentValue=Cfg.foxyInt, Flag="fi", Callback=function(v) Cfg.foxyInt=v end })
+TC:CreateSlider({ Name="Scan Rate (x100 s)",    Range={5,60}, Increment=1, CurrentValue=math.floor(Cfg.scan*100), Flag="sr", Callback=function(v) Cfg.scan=v/100 end })
+
+-- sanity check on load
+local missing={}
+if not OB then missing[#missing+1]="OfficeButtons" end
+if not Side.left.btnPrompt and not Side.left.btnCD then missing[#missing+1]="LeftDoorButton input" end
+if not Remotes.switchCam then missing[#missing+1]="switchCam remote" end
+if #missing>0 then toast("Loaded with warnings: "..table.concat(missing,", "))
+else toast("Loaded clean. Press MASTER then BEAT ALL NIGHTS.") end
