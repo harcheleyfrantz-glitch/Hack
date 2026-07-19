@@ -1,0 +1,478 @@
+--[[
+    ==================================================================
+      ENTRENCHED WW1 :: UNIVERSAL DUMPER  v1
+      Target PlaceId: ENTRENCHED WW1  (roblox.com/games/3678761576)
+      Executor: Delta  (iOS + Android)  -- pure native, no UI library
+      ------------------------------------------------------------------
+      WHAT IT DOES
+        * Auto-runs every STATIC dump on execute and writes .txt files
+          into the Delta workspace folder:  workspace/ENTRENCHED_DUMP/
+        * Small native on-screen panel to START / STOP the LIVE remote
+          argument logger (hooks __namecall) -> args.txt
+        * On-screen notifications so you can follow it on mobile.
+      ------------------------------------------------------------------
+      FILES WRITTEN (inside ENTRENCHED_DUMP/):
+        summary.txt            - index + counts + executor info
+        remotes.txt            - every Remote/Bindable Event+Function
+        workspace.txt          - Workspace instance tree
+        replicatedstorage.txt  - ReplicatedStorage tree
+        replicatedfirst.txt    - ReplicatedFirst tree
+        modules.txt            - every ModuleScript path
+        nil_instances.txt      - orphaned/nil-parent instances (weapons!)
+        players.txt            - players, teams, userids
+        teams.txt              - teams + members
+        character.txt          - your character, humanoid, tools
+        tools_weapons.txt      - Tools + their remotes/values/config
+        guis.txt               - PlayerGui tree
+        keyword_instances.txt  - anything combat/weapon/health related
+        args.txt               - LIVE remote calls w/ args (after you log)
+    ==================================================================
+]]
+
+--========================= EXECUTOR / FILE IO ====================--
+local execName = (identifyexecutor and identifyexecutor()) or (getexecutorname and getexecutorname()) or "Unknown"
+local writefile   = writefile   or (syn and syn.write_file)
+local makefolder  = makefolder
+local isfolder    = isfolder
+local FOLDER = "ENTRENCHED_DUMP"
+
+local HAS_FILES = type(writefile) == "function"
+
+local function ensureFolder()
+    if makefolder and isfolder then
+        pcall(function() if not isfolder(FOLDER) then makefolder(FOLDER) end end)
+    end
+end
+ensureFolder()
+
+-- writes text to FOLDER/name ; falls back gracefully
+local function save(name, text)
+    if not HAS_FILES then
+        warn("[DUMP] writefile not supported by this executor; printing "..name)
+        print(text)
+        return false
+    end
+    local path = (makefolder and (FOLDER.."/"..name)) or (FOLDER.."_"..name)
+    local ok, err = pcall(writefile, path, text)
+    if ok then print("[DUMP] wrote "..path.." ("..#text.." bytes)")
+    else warn("[DUMP] FAILED "..path.." -> "..tostring(err)) end
+    return ok
+end
+
+--========================= NOTIFY ================================--
+local StarterGui = game:GetService("StarterGui")
+local function notify(title, text, dur)
+    print("[DUMP] "..tostring(title).." | "..tostring(text))
+    pcall(function()
+        StarterGui:SetCore("SendNotification", { Title=title, Text=text, Duration=dur or 4 })
+    end)
+end
+
+--========================= SERVICES ==============================--
+local Players   = game:GetService("Players")
+local RS        = game:GetService("ReplicatedStorage")
+local RF        = game:GetService("ReplicatedFirst")
+local Workspace = game:GetService("Workspace")
+local Teams     = game:GetService("Teams")
+local LP        = Players.LocalPlayer
+
+--========================= HELPERS ===============================--
+local function fullName(inst)
+    local ok, n = pcall(function() return inst:GetFullName() end)
+    return ok and n or tostring(inst)
+end
+
+local function typeOf(v) return (typeof and typeof(v)) or type(v) end
+
+-- serialize a single value for the args log
+local function ser(v, depth)
+    depth = depth or 0
+    local t = typeOf(v)
+    if t == "Instance" then
+        return ("%s <Instance:%s>"):format(fullName(v), v.ClassName)
+    elseif t == "string" then
+        if #v > 200 then v = v:sub(1,200).."...(truncated)" end
+        return string.format("%q", v)
+    elseif t == "number" or t == "boolean" or t == "nil" then
+        return tostring(v)
+    elseif t == "Vector3" then
+        return ("Vector3(%.3f, %.3f, %.3f)"):format(v.X, v.Y, v.Z)
+    elseif t == "Vector2" then
+        return ("Vector2(%.3f, %.3f)"):format(v.X, v.Y)
+    elseif t == "CFrame" then
+        local x,y,z = v.Position.X, v.Position.Y, v.Position.Z
+        return ("CFrame(pos %.2f, %.2f, %.2f)"):format(x,y,z)
+    elseif t == "Color3" then
+        return ("Color3(%.2f, %.2f, %.2f)"):format(v.R, v.G, v.B)
+    elseif t == "table" then
+        if depth > 2 then return "{...}" end
+        local parts = {}
+        local count = 0
+        for k, val in pairs(v) do
+            count = count + 1
+            if count > 15 then parts[#parts+1] = "..." break end
+            parts[#parts+1] = ("[%s]=%s"):format(tostring(k), ser(val, depth+1))
+        end
+        return "{ "..table.concat(parts, ", ").." }"
+    else
+        return tostring(v).." <"..t..">"
+    end
+end
+
+--========================= TREE DUMPER ===========================--
+-- depth/node-capped so it never freezes mobile
+local function dumpTree(root, maxDepth, maxNodes)
+    maxDepth = maxDepth or 6
+    maxNodes = maxNodes or 6000
+    local lines = {}
+    local nodes = 0
+    local truncated = false
+    local function walk(inst, depth)
+        if truncated then return end
+        local kids
+        local ok = pcall(function() kids = inst:GetChildren() end)
+        if not ok or not kids then return end
+        for _, c in ipairs(kids) do
+            nodes = nodes + 1
+            if nodes > maxNodes then truncated = true; lines[#lines+1] = "  ...(node cap reached)"; return end
+            local nm = "?"; pcall(function() nm = c.Name end)
+            local cls = "?"; pcall(function() cls = c.ClassName end)
+            lines[#lines+1] = ("%s%s  [%s]"):format(string.rep("  ", depth+1), nm, cls)
+            if depth + 1 < maxDepth then walk(c, depth + 1) end
+        end
+    end
+    walk(root, 0)
+    return table.concat(lines, "\n"), nodes, truncated
+end
+
+local function header(title, extra)
+    return ("== %s ==\nGame PlaceId: %s\nExecutor: %s\nGenerated: %s\n%s%s\n"):format(
+        title, tostring(game.PlaceId), execName, os.date("%Y-%m-%d %H:%M:%S"),
+        extra and (extra.."\n") or "",
+        string.rep("-", 60))
+end
+
+--========================= STATIC DUMPS ==========================--
+local counts = {}
+
+-- 1) REMOTES  (recursive scan of entire DataModel)
+local function dumpRemotes()
+    local classes = {
+        RemoteEvent=true, RemoteFunction=true, BindableEvent=true,
+        BindableFunction=true, UnreliableRemoteEvent=true,
+    }
+    local found = {}
+    for _, d in ipairs(game:GetDescendants()) do
+        local ok, cls = pcall(function() return d.ClassName end)
+        if ok and classes[cls] then
+            found[#found+1] = ("[%s]  %s"):format(cls, fullName(d))
+        end
+    end
+    table.sort(found)
+    counts.remotes = #found
+    save("remotes.txt", header("REMOTES", "Total: "..#found).."\n"..table.concat(found, "\n").."\n")
+end
+
+-- 2) WORKSPACE TREE
+local function dumpWorkspace()
+    local tree, n, trunc = dumpTree(Workspace, 6, 8000)
+    counts.workspace_nodes = n
+    save("workspace.txt", header("WORKSPACE TREE", "Nodes: "..n..(trunc and "  (TRUNCATED)" or "")).."\nworkspace/\n"..tree.."\n")
+end
+
+-- 3) REPLICATEDSTORAGE + 4) REPLICATEDFIRST
+local function dumpRS()
+    local tree, n = dumpTree(RS, 8, 6000)
+    save("replicatedstorage.txt", header("REPLICATEDSTORAGE TREE", "Nodes: "..n).."\nReplicatedStorage/\n"..tree.."\n")
+    local tree2, n2 = dumpTree(RF, 8, 3000)
+    save("replicatedfirst.txt", header("REPLICATEDFIRST TREE", "Nodes: "..n2).."\nReplicatedFirst/\n"..tree2.."\n")
+end
+
+-- 5) MODULES  (module scripts are where weapon/damage logic lives)
+local function dumpModules()
+    local mods = {}
+    for _, d in ipairs(game:GetDescendants()) do
+        local ok, cls = pcall(function() return d.ClassName end)
+        if ok and cls == "ModuleScript" then mods[#mods+1] = fullName(d) end
+    end
+    table.sort(mods)
+    counts.modules = #mods
+    -- getloadedmodules for the ones actually required
+    local loadedTxt = ""
+    if getloadedmodules then
+        local ok, loaded = pcall(getloadedmodules)
+        if ok and loaded then
+            local ll = {}
+            for _, m in ipairs(loaded) do pcall(function() ll[#ll+1] = fullName(m) end) end
+            loadedTxt = "\n\n== LOADED (required) MODULES: "..#ll.." ==\n"..table.concat(ll, "\n")
+        end
+    end
+    save("modules.txt", header("MODULESCRIPTS", "Total: "..#mods).."\n"..table.concat(mods, "\n")..loadedTxt.."\n")
+end
+
+-- 6) NIL INSTANCES  (weapon models/tools parked outside the tree)
+local function dumpNil()
+    if not getnilinstances then
+        save("nil_instances.txt", header("NIL INSTANCES", "getnilinstances not supported by this executor").."\n")
+        return
+    end
+    local ok, nils = pcall(getnilinstances)
+    if not ok or not nils then save("nil_instances.txt", header("NIL INSTANCES","failed").."\n") return end
+    local lines = {}
+    for _, d in ipairs(nils) do
+        local nm, cls = "?", "?"
+        pcall(function() nm = d.Name end); pcall(function() cls = d.ClassName end)
+        lines[#lines+1] = ("[%s]  %s"):format(cls, nm)
+    end
+    counts.nil_instances = #lines
+    save("nil_instances.txt", header("NIL INSTANCES","Total: "..#lines).."\n"..table.concat(lines,"\n").."\n")
+end
+
+-- 7) PLAYERS + 8) TEAMS
+local function dumpPlayers()
+    local lines = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        local team = "?"; pcall(function() team = p.Team and p.Team.Name or "none" end)
+        local alive = "?"; pcall(function()
+            local hum = p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+            alive = (hum and hum.Health > 0) and ("alive("..math.floor(hum.Health)..")") or "dead/none"
+        end)
+        lines[#lines+1] = ("%s (@%s)  UserId=%s  Team=%s  %s%s"):format(
+            p.DisplayName, p.Name, tostring(p.UserId), team, alive, p==LP and "  <-- YOU" or "")
+    end
+    counts.players = #lines
+    save("players.txt", header("PLAYERS","Total: "..#lines.."   YourTeam: "..tostring(LP.Team and LP.Team.Name or "none")).."\n"..table.concat(lines,"\n").."\n")
+
+    local tlines = {}
+    for _, t in ipairs(Teams:GetTeams()) do
+        tlines[#tlines+1] = ("[%s]  Color=%s"):format(t.Name, tostring(t.TeamColor))
+        for _, p in ipairs(t:GetPlayers()) do tlines[#tlines+1] = "    "..p.Name.." (@"..p.DisplayName..")" end
+    end
+    save("teams.txt", header("TEAMS","Total: "..#Teams:GetTeams()).."\n"..table.concat(tlines,"\n").."\n")
+end
+
+-- 9) LOCAL CHARACTER + humanoid + tools
+local function dumpCharacter()
+    local out = {}
+    local char = LP.Character or (LP.CharacterAdded and LP.CharacterAdded:Wait())
+    if char then
+        out[#out+1] = "Character: "..char.Name
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            out[#out+1] = ("Humanoid: Health=%s/%s  WalkSpeed=%s  JumpPower=%s"):format(
+                tostring(hum.Health), tostring(hum.MaxHealth), tostring(hum.WalkSpeed), tostring(hum.JumpPower))
+        end
+        out[#out+1] = "\n-- Children --"
+        for _, c in ipairs(char:GetChildren()) do
+            out[#out+1] = ("  %s [%s]"):format(c.Name, c.ClassName)
+        end
+        out[#out+1] = "\n-- Full tree --"
+        local tree = dumpTree(char, 5, 2000)
+        out[#out+1] = tree
+    else
+        out[#out+1] = "No character."
+    end
+    save("character.txt", header("LOCAL CHARACTER").."\n"..table.concat(out,"\n").."\n")
+end
+
+-- 10) TOOLS / WEAPONS  (Tools anywhere + their remotes / values / attributes)
+local function dumpTools()
+    local out = {}
+    local seen = {}
+    local function scanTool(t)
+        if seen[t] then return end seen[t] = true
+        out[#out+1] = ("\n[TOOL] %s"):format(fullName(t))
+        for _, d in ipairs(t:GetDescendants()) do
+            local cls = d.ClassName
+            if cls=="RemoteEvent" or cls=="RemoteFunction" or cls=="BindableEvent"
+               or cls=="NumberValue" or cls=="IntValue" or cls=="StringValue"
+               or cls=="BoolValue" or cls=="ModuleScript" or cls=="LocalScript"
+               or cls=="ObjectValue" or cls=="Configuration" then
+                local extra = ""
+                if cls:find("Value") then pcall(function() extra = " = "..tostring(d.Value) end) end
+                out[#out+1] = ("    [%s] %s%s"):format(cls, d.Name, extra)
+            end
+        end
+        -- attributes
+        local ok, attrs = pcall(function() return t:GetAttributes() end)
+        if ok and attrs then for k,v in pairs(attrs) do out[#out+1] = ("    <attr> %s = %s"):format(k, tostring(v)) end end
+    end
+    for _, d in ipairs(game:GetDescendants()) do
+        local ok, cls = pcall(function() return d.ClassName end)
+        if ok and cls == "Tool" then scanTool(d) end
+    end
+    counts.tools = 0
+    for _ in pairs(seen) do counts.tools = counts.tools + 1 end
+    save("tools_weapons.txt", header("TOOLS / WEAPONS","Total tools: "..counts.tools).."\n"..table.concat(out,"\n").."\n")
+end
+
+-- 11) PLAYER GUI
+local function dumpGuis()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then save("guis.txt", header("PLAYERGUI","none").."\n") return end
+    local tree, n = dumpTree(pg, 8, 5000)
+    save("guis.txt", header("PLAYERGUI TREE","Nodes: "..n).."\nPlayerGui/\n"..tree.."\n")
+end
+
+-- 12) KEYWORD INSTANCES (combat/weapon/health relevant)
+local function dumpKeywords()
+    local kw = {
+        "weapon","gun","rifle","bullet","ammo","reload","fire","shoot","shot",
+        "damage","health","hit","hitbox","melee","bayonet","knife","grenade",
+        "spawn","team","aim","recoil","kill","death","respawn","class","loadout",
+        "combat","projectile","raycast","tag","score",
+    }
+    local lower = {}
+    for _, w in ipairs(kw) do lower[#lower+1] = w end
+    local matches = {}
+    local cap = 4000
+    for _, d in ipairs(game:GetDescendants()) do
+        if #matches >= cap then break end
+        local nm; local ok = pcall(function() nm = d.Name end)
+        if ok and nm then
+            local ln = nm:lower()
+            for _, w in ipairs(lower) do
+                if ln:find(w, 1, true) then
+                    local cls = "?"; pcall(function() cls = d.ClassName end)
+                    matches[#matches+1] = ("[%s]  %s"):format(cls, fullName(d))
+                    break
+                end
+            end
+        end
+    end
+    counts.keywords = #matches
+    save("keyword_instances.txt", header("KEYWORD INSTANCES","Total: "..#matches).."\n"..table.concat(matches,"\n").."\n")
+end
+
+--========================= LIVE ARG LOGGER =======================--
+local logging = false
+local argLog = {}
+local hooked = false
+local maxLogEntries = 1500
+
+local function recordCall(self, method, args)
+    if #argLog >= maxLogEntries then return end
+    local lines = {}
+    lines[#lines+1] = ("[%s] %s"):format(os.date("%H:%M:%S"), fullName(self))
+    lines[#lines+1] = ("    method: %s"):format(method)
+    local n = select("#", table.unpack(args, 1, args.n))
+    lines[#lines+1] = ("    args (%d):"):format(args.n or #args)
+    for i = 1, (args.n or #args) do
+        lines[#lines+1] = ("        [%d] %s"):format(i, ser(args[i]))
+    end
+    lines[#lines+1] = ""
+    argLog[#argLog+1] = table.concat(lines, "\n")
+end
+
+local function installHook()
+    if hooked then return true end
+    if not (hookmetamethod and getnamecallmethod) then
+        notify("Arg Logger", "hookmetamethod/getnamecallmethod not supported", 6)
+        return false
+    end
+    local ok, old = pcall(function()
+        local oldNamecall
+        oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+            if logging then
+                local method = getnamecallmethod()
+                if method == "FireServer" or method == "InvokeServer" then
+                    local args = table.pack(...)
+                    pcall(recordCall, self, method, args)
+                end
+            end
+            return oldNamecall(self, ...)
+        end)
+        return oldNamecall
+    end)
+    if ok then hooked = true; return true end
+    notify("Arg Logger", "hook failed: "..tostring(old), 6)
+    return false
+end
+
+local function startLog()
+    if not installHook() then return end
+    argLog = {}
+    logging = true
+    notify("Arg Logger", "RECORDING remote args... play/shoot now, then STOP.", 5)
+end
+
+local function stopLog()
+    logging = false
+    local text = header("LIVE REMOTE ARGS", "Captured entries: "..#argLog).."\n"..table.concat(argLog, "\n")
+    save("args.txt", text)
+    notify("Arg Logger", "Saved args.txt ("..#argLog.." entries)", 6)
+end
+
+--========================= RUN STATIC DUMPS ======================--
+local function runAllStatic()
+    notify("Dumper", "Running static dumps...", 4)
+    local steps = {
+        {"remotes", dumpRemotes}, {"workspace", dumpWorkspace}, {"replicated", dumpRS},
+        {"modules", dumpModules}, {"nil", dumpNil}, {"players/teams", dumpPlayers},
+        {"character", dumpCharacter}, {"tools", dumpTools}, {"guis", dumpGuis},
+        {"keywords", dumpKeywords},
+    }
+    for _, s in ipairs(steps) do
+        local ok, err = pcall(s[2])
+        if not ok then warn("[DUMP] step "..s[1].." failed: "..tostring(err)) end
+        task.wait() -- yield so mobile doesn't hang
+    end
+    -- summary
+    local sum = {}
+    sum[#sum+1] = header("SUMMARY / INDEX")
+    sum[#sum+1] = "Folder: "..FOLDER.."/   (open in Delta file manager)"
+    sum[#sum+1] = ""
+    sum[#sum+1] = "Counts:"
+    for k, v in pairs(counts) do sum[#sum+1] = ("  %-18s %s"):format(k, tostring(v)) end
+    sum[#sum+1] = ""
+    sum[#sum+1] = "Files: remotes / workspace / replicatedstorage / replicatedfirst /"
+    sum[#sum+1] = "       modules / nil_instances / players / teams / character /"
+    sum[#sum+1] = "       tools_weapons / guis / keyword_instances / args (after logging)"
+    save("summary.txt", table.concat(sum, "\n").."\n")
+    notify("Dumper", "STATIC DUMPS DONE. Check "..FOLDER.."/", 8)
+end
+
+--========================= NATIVE CONTROL PANEL ==================--
+-- tiny, no library. only reason it exists: you control arg-logger timing on mobile.
+local function buildPanel()
+    local CoreGui = (gethui and gethui()) or game:GetService("CoreGui")
+    pcall(function() local o = CoreGui:FindFirstChild("ENTRENCHED_DUMPER"); if o then o:Destroy() end end)
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "ENTRENCHED_DUMPER"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true
+    gui.DisplayOrder = 999999
+    local ok = pcall(function() gui.Parent = CoreGui end)
+    if not ok or not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromOffset(210, 176); frame.Position = UDim2.new(0, 12, 0.5, -88)
+    frame.BackgroundColor3 = Color3.fromRGB(24,24,28); frame.BorderSizePixel = 0; frame.Active = true; frame.Draggable = true
+    frame.Parent = gui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0,10)
+    local stroke = Instance.new("UIStroke", frame); stroke.Color = Color3.fromRGB(120,90,40); stroke.Thickness = 1.5
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1,0,0,30); title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold; title.TextSize = 14; title.TextColor3 = Color3.fromRGB(235,200,140)
+    title.Text = "ENTRENCHED DUMPER"; title.Parent = frame
+
+    local function mkBtn(txt, y, col, cb)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1,-16,0,32); b.Position = UDim2.new(0,8,0,y)
+        b.BackgroundColor3 = col; b.Font = Enum.Font.GothamMedium; b.TextSize = 13
+        b.TextColor3 = Color3.fromRGB(240,240,240); b.Text = txt; b.AutoButtonColor = true; b.Parent = frame
+        Instance.new("UICorner", b).CornerRadius = UDim.new(0,8)
+        b.Activated:Connect(function() pcall(cb) end)
+        return b
+    end
+    mkBtn("Re-run Static Dumps", 34, Color3.fromRGB(45,90,140), runAllStatic)
+    mkBtn("START Arg Log", 70, Color3.fromRGB(45,130,70), startLog)
+    mkBtn("STOP + Save Args", 106, Color3.fromRGB(150,60,55), stopLog)
+    mkBtn("Close Panel", 142, Color3.fromRGB(60,60,68), function() gui:Destroy() end)
+end
+
+--========================= GO ====================================--
+notify("Dumper", "Executor: "..execName.."  Files: "..tostring(HAS_FILES), 5)
+buildPanel()
+task.spawn(runAllStatic)
+print("=== ENTRENCHED DUMPER READY ===  folder: "..FOLDER.."/  executor: "..execName)
